@@ -116,6 +116,9 @@ pub mod frontend_service {
     /// Total number of output tokens generated (counter that updates in real-time)
     pub const OUTPUT_TOKENS_TOTAL: &str = "output_tokens_total";
 
+    /// Cached prompt tokens observed after KV cache reuse
+    pub const CACHED_PROMPT_TOKENS: &str = "cached_prompt_tokens";
+
     /// Time to first token in seconds
     pub const TIME_TO_FIRST_TOKEN_SECONDS: &str = "time_to_first_token_seconds";
 

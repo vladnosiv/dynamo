@@ -57,6 +57,8 @@ class frontend_service:
     OUTPUT_SEQUENCE_TOKENS = "output_sequence_tokens"
     # Total number of output tokens generated (counter that updates in real-time)
     OUTPUT_TOKENS_TOTAL = "output_tokens_total"
+    # Cached prompt tokens observed after KV cache reuse
+    CACHED_PROMPT_TOKENS = "cached_prompt_tokens"
     # Time to first token in seconds
     TIME_TO_FIRST_TOKEN_SECONDS = "time_to_first_token_seconds"
     # Inter-token latency in seconds
