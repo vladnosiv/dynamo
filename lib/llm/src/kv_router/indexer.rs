@@ -41,7 +41,7 @@ use prometheus::{IntCounterVec, Opts};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     iter,
     rc::Rc,
     sync::{Arc, OnceLock},
@@ -81,6 +81,9 @@ pub enum KvCacheEventError {
 
     #[error("Failed to find block")]
     BlockNotFound,
+
+    #[error("Invalid block sequence")]
+    InvalidBlockSequence,
 }
 
 /// A shared reference to a [`RadixBlock`].
@@ -380,6 +383,26 @@ impl RadixTree {
                     }
                 };
 
+                {
+                    // Validate block hashes upfront to prevent cycles anywhere in the event.
+                    let mut seen_hashes: HashSet<ExternalSequenceBlockHash> = HashSet::new();
+                    if let Some(parent) = op.parent_hash {
+                        seen_hashes.insert(parent);
+                    }
+                    for block_id in &op.blocks {
+                        if !seen_hashes.insert(block_id.block_hash) {
+                            tracing::warn!(
+                                worker_id = worker.worker_id.to_string(),
+                                dp_rank = worker.dp_rank,
+                                id,
+                                block_hash = ?block_id.block_hash,
+                                "Detected cycle in store event (repeating block hash); rejecting sequence"
+                            );
+                            return Err(KvCacheEventError::InvalidBlockSequence);
+                        }
+                    }
+                }
+
                 for block_id in op.blocks {
                     let mut inner = current.borrow_mut();
                     let block = match inner.children.get(&block_id.tokens_hash) {
@@ -602,6 +625,7 @@ pub struct KvIndexerMetrics {
 pub const METRIC_STATUS_OK: &str = "ok";
 pub const METRIC_STATUS_PARENT_NOT_FOUND: &str = "parent_block_not_found";
 pub const METRIC_STATUS_BLOCK_NOT_FOUND: &str = "block_not_found";
+pub const METRIC_STATUS_INVALID_BLOCK: &str = "invalid_block";
 
 /// Metric event labels.
 pub const METRIC_EVENT_STORED: &str = "stored";
@@ -674,6 +698,7 @@ impl KvIndexerMetrics {
                 let error_label = match e {
                     KvCacheEventError::ParentBlockNotFound => METRIC_STATUS_PARENT_NOT_FOUND,
                     KvCacheEventError::BlockNotFound => METRIC_STATUS_BLOCK_NOT_FOUND,
+                    KvCacheEventError::InvalidBlockSequence => METRIC_STATUS_INVALID_BLOCK,
                 };
                 self.kv_cache_events_applied
                     .with_label_values(&[event_type, error_label])
@@ -1732,6 +1757,41 @@ mod tests {
             result.unwrap_err(),
             KvCacheEventError::BlockNotFound
         ));
+
+        // Prepare a valid root block
+        trie.apply_event(create_store_event(worker_0, 1, vec![0], None))
+            .unwrap();
+
+        // Self-referential block should be rejected
+        let result = trie.apply_event(create_store_event(
+            worker_0,
+            2,
+            vec![0],
+            Some(ExternalSequenceBlockHash(0)),
+        ));
+        assert!(matches!(
+            result.unwrap_err(),
+            KvCacheEventError::InvalidBlockSequence
+        ));
+
+        // Cycle further down the chain (A -> B -> A)
+        let result = trie.apply_event(create_store_event(
+            worker_0,
+            3,
+            vec![1, 0],
+            Some(ExternalSequenceBlockHash(0)),
+        ));
+        assert!(matches!(
+            result.unwrap_err(),
+            KvCacheEventError::InvalidBlockSequence
+        ));
+
+        // Tree remains unchanged beyond the root block
+        assert_eq!(
+            trie.root.borrow().children.len(),
+            1,
+            "Invalid block must not mutate the radix tree"
+        );
     }
 
     #[test]
