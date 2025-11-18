@@ -155,6 +155,7 @@ The Dynamo HTTP Frontend (`python -m dynamo.frontend`) exposes `dynamo_frontend_
 - `dynamo_frontend_inter_token_latency_seconds`: Inter-token latency (histogram)
 - `dynamo_frontend_output_sequence_tokens`: Output sequence length (histogram)
 - `dynamo_frontend_output_tokens_total`: Total number of output tokens generated (counter)
+- `dynamo_frontend_cached_prompt_tokens`: Cached prompt tokens reused from KV cache (histogram)
 - `dynamo_frontend_request_duration_seconds`: LLM request duration (histogram)
 - `dynamo_frontend_requests_total`: Total LLM requests (counter)
 - `dynamo_frontend_time_to_first_token_seconds`: Time to first token (histogram)

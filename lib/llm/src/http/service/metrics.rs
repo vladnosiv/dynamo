@@ -23,7 +23,14 @@ use std::{
 
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 use crate::model_card::ModelDeploymentCard;
+use crate::protocols::openai::{
+    chat_completions::{NvCreateChatCompletionResponse, NvCreateChatCompletionStreamResponse},
+    completions::NvCreateCompletionResponse,
+};
 use dynamo_runtime::metrics::prometheus_names::clamp_u64_to_i64;
+
+use dynamo_async_openai::types::CompletionUsage;
+use std::any::Any;
 
 pub use prometheus::Registry;
 
@@ -166,6 +173,7 @@ pub struct Metrics {
     input_sequence_length: HistogramVec,
     output_sequence_length: HistogramVec,
     output_tokens_counter: IntCounterVec,
+    cached_prompt_tokens: HistogramVec,
     time_to_first_token: HistogramVec,
     inter_token_latency: HistogramVec,
 
@@ -252,6 +260,7 @@ pub struct ResponseMetricCollector {
     // be computed.
     last_response_time: Option<Duration>,
     osl: usize,
+    cached_prompt_tokens: Option<u64>,
 }
 
 impl Default for Metrics {
@@ -378,7 +387,17 @@ impl Metrics {
                 frontend_metric_name(frontend_service::INPUT_SEQUENCE_TOKENS),
                 "Input sequence length in tokens",
             )
-            .buckets(input_sequence_buckets),
+            .buckets(input_sequence_buckets.clone()),
+            &["model"],
+        )
+        .unwrap();
+
+        let cached_prompt_tokens = HistogramVec::new(
+            HistogramOpts::new(
+                frontend_metric_name(frontend_service::CACHED_PROMPT_TOKENS),
+                "Cached prompt tokens reused from KV cache",
+            )
+            .buckets(input_sequence_buckets.clone()),
             &["model"],
         )
         .unwrap();
@@ -503,6 +522,7 @@ impl Metrics {
             input_sequence_length,
             output_sequence_length,
             output_tokens_counter,
+            cached_prompt_tokens,
             time_to_first_token,
             inter_token_latency,
             model_total_kv_blocks,
@@ -598,6 +618,7 @@ impl Metrics {
         registry.register(Box::new(self.input_sequence_length.clone()))?;
         registry.register(Box::new(self.output_sequence_length.clone()))?;
         registry.register(Box::new(self.output_tokens_counter.clone()))?;
+        registry.register(Box::new(self.cached_prompt_tokens.clone()))?;
         registry.register(Box::new(self.time_to_first_token.clone()))?;
         registry.register(Box::new(self.inter_token_latency.clone()))?;
 
@@ -821,6 +842,51 @@ impl Status {
     }
 }
 
+fn cached_tokens_from_completion_usage(usage: &CompletionUsage) -> u64 {
+    usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.cached_tokens)
+        .unwrap_or(0) as u64
+}
+
+fn cached_prompt_tokens_from_data(data: &dyn Any) -> Option<u64> {
+    if let Some(resp) = data.downcast_ref::<NvCreateCompletionResponse>() {
+        return resp
+            .inner
+            .usage
+            .as_ref()
+            .map(|usage| cached_tokens_from_completion_usage(usage));
+    }
+
+    if let Some(resp) = data.downcast_ref::<NvCreateChatCompletionResponse>() {
+        return resp
+            .usage
+            .as_ref()
+            .map(|usage| cached_tokens_from_completion_usage(usage));
+    }
+
+    if let Some(resp) = data.downcast_ref::<NvCreateChatCompletionStreamResponse>() {
+        return resp
+            .usage
+            .as_ref()
+            .map(|usage| cached_tokens_from_completion_usage(usage));
+    }
+
+    None
+}
+
+fn record_cached_prompt_tokens_if_present<T: 'static>(
+    annotated: &crate::types::Annotated<T>,
+    response_collector: &mut ResponseMetricCollector,
+) {
+    if let Some(data) = annotated.data.as_ref()
+        && let Some(value) = cached_prompt_tokens_from_data(data as &dyn Any)
+    {
+        response_collector.record_cached_prompt_tokens(value);
+    }
+}
+
 impl ResponseMetricCollector {
     fn new(metrics: Arc<Metrics>, model: String) -> Self {
         ResponseMetricCollector {
@@ -830,6 +896,7 @@ impl ResponseMetricCollector {
             last_response_time: None,
             start_time: Instant::now(),
             osl: 0,
+            cached_prompt_tokens: None,
         }
     }
 
@@ -841,6 +908,10 @@ impl ResponseMetricCollector {
     /// Check if this will be the first token (before calling observe_response)
     pub fn is_first_token(&self) -> bool {
         self.is_first_token
+    }
+
+    fn record_cached_prompt_tokens(&mut self, cached_tokens: u64) {
+        self.cached_prompt_tokens = Some(cached_tokens);
     }
 
     /// Observe a response with input sequence length and number of new tokens
@@ -899,6 +970,12 @@ impl Drop for ResponseMetricCollector {
             .output_sequence_length
             .with_label_values(&[&self.model])
             .observe(self.osl as f64);
+
+        let cached_tokens = self.cached_prompt_tokens.unwrap_or(0);
+        self.metrics
+            .cached_prompt_tokens
+            .with_label_values(&[&self.model])
+            .observe(cached_tokens as f64);
     }
 }
 
@@ -907,12 +984,14 @@ impl Drop for ResponseMetricCollector {
 /// This function handles metrics collection and http_queue_guard management for streaming responses.
 /// It observes the current output sequence length, drops the http_queue_guard on the first token,
 /// and records response metrics.
-pub fn process_response_and_observe_metrics<T>(
+pub fn process_response_and_observe_metrics<T: 'static>(
     annotated: &crate::types::Annotated<T>,
     response_collector: &mut ResponseMetricCollector,
     http_queue_guard: &mut Option<HttpQueueGuard>,
 ) {
     use crate::preprocessor::LLMMetricAnnotation;
+
+    record_cached_prompt_tokens_if_present(annotated, response_collector);
 
     // update metrics
     if let Ok(Some(metrics)) = LLMMetricAnnotation::from_annotation(annotated) {
@@ -943,7 +1022,7 @@ impl<T> From<crate::types::Annotated<T>> for EventConverter<T> {
 ///
 /// This function handles metrics collection, http_queue_guard management, and converts
 /// annotated responses to SSE events for streaming responses.
-pub fn process_response_using_event_converter_and_observe_metrics<T: Serialize>(
+pub fn process_response_using_event_converter_and_observe_metrics<T: Serialize + 'static>(
     annotated: EventConverter<T>,
     response_collector: &mut ResponseMetricCollector,
     http_queue_guard: &mut Option<HttpQueueGuard>,
@@ -951,6 +1030,8 @@ pub fn process_response_using_event_converter_and_observe_metrics<T: Serialize>(
     use crate::preprocessor::LLMMetricAnnotation;
 
     let mut annotated = annotated.0;
+
+    record_cached_prompt_tokens_if_present(&annotated, response_collector);
 
     // update metrics
     if let Ok(Some(metrics)) = LLMMetricAnnotation::from_annotation(&annotated) {
@@ -1047,6 +1128,9 @@ async fn handler_metrics(State(state): State<Arc<MetricsHandlerState>>) -> impl 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preprocessor::LLMMetricAnnotation;
+    use crate::types::Annotated;
+    use dynamo_async_openai::types::{Choice, CompletionUsage, PromptTokensDetails};
 
     #[test]
     fn test_round_to_sig_figs() {
@@ -1355,6 +1439,116 @@ mod tests {
                 .with_label_values(&[model2])
                 .get(),
             20
+        );
+    }
+
+    fn build_annotated_completion_response(
+        cached_tokens: Option<u32>,
+        chunk_tokens: usize,
+    ) -> Annotated<NvCreateCompletionResponse> {
+        let llm_metrics = LLMMetricAnnotation {
+            input_tokens: 100,
+            output_tokens: chunk_tokens,
+            chunk_tokens,
+        };
+        let mut metrics_annotation = llm_metrics.to_annotation::<()>().unwrap();
+        let response = NvCreateCompletionResponse {
+            inner: dynamo_async_openai::types::CreateCompletionResponse {
+                id: "cmpl-test".into(),
+                object: "text_completion".into(),
+                created: 0,
+                model: "test-model".into(),
+                system_fingerprint: None,
+                choices: vec![Choice {
+                    text: "".into(),
+                    index: 0,
+                    finish_reason: None,
+                    logprobs: None,
+                }],
+                usage: Some(CompletionUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: chunk_tokens as u32,
+                    total_tokens: chunk_tokens as u32,
+                    prompt_tokens_details: cached_tokens.map(|value| PromptTokensDetails {
+                        audio_tokens: None,
+                        cached_tokens: Some(value),
+                    }),
+                    completion_tokens_details: None,
+                }),
+            },
+        };
+
+        Annotated {
+            id: metrics_annotation.id.take(),
+            data: Some(response),
+            event: metrics_annotation.event.take(),
+            comment: metrics_annotation.comment.take(),
+        }
+    }
+
+    #[test]
+    fn test_cached_prompt_tokens_histogram_records_usage() {
+        let metrics = Arc::new(Metrics::new());
+        let registry = prometheus::Registry::new();
+        metrics.register(&registry).unwrap();
+
+        let model = "test-model";
+
+        {
+            let mut collector = metrics.clone().create_response_collector(model);
+            let mut http_queue_guard = Some(metrics.clone().create_http_queue_guard(model));
+            let annotated = build_annotated_completion_response(Some(7), 5);
+
+            process_response_and_observe_metrics(
+                &annotated,
+                &mut collector,
+                &mut http_queue_guard,
+            );
+        }
+
+        let histogram = metrics.cached_prompt_tokens.with_label_values(&[model]);
+        assert_eq!(
+            histogram.get_sample_count(),
+            1,
+            "should record exactly one observation"
+        );
+        assert_eq!(
+            histogram.get_sample_sum(),
+            7.0,
+            "cached tokens sum should match usage-provided value"
+        );
+    }
+
+    #[test]
+    fn test_cached_prompt_tokens_histogram_records_zero_when_details_missing() {
+        let metrics = Arc::new(Metrics::new());
+        let registry = prometheus::Registry::new();
+        metrics.register(&registry).unwrap();
+
+        let model = "test-model";
+
+        {
+            let mut collector = metrics.clone().create_response_collector(model);
+            let mut http_queue_guard = Some(metrics.clone().create_http_queue_guard(model));
+            let annotated = build_annotated_completion_response(None, 5);
+
+            process_response_and_observe_metrics(
+                &annotated,
+                &mut collector,
+                &mut http_queue_guard,
+            );
+        }
+
+        let histogram = metrics.cached_prompt_tokens.with_label_values(&[model]);
+        assert_eq!(
+            histogram.get_sample_count(),
+            1,
+            "missing prompt tokens details should still record an observation"
+        );
+        assert_eq!(
+            histogram.get_sample_sum(),
+            0.0,
+            "missing prompt tokens details should record zero cached tokens"
         );
     }
 }
