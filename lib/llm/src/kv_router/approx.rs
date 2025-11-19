@@ -490,7 +490,7 @@ impl KvIndexerInterface for ApproxKvIndexer {
         };
 
         if let Err(e) = self.match_tx.send(request).await {
-            tracing::warn!(
+            tracing::error!(
                 error = ?e,
                 "Failed to send match request; approximate indexer maybe offline"
             );
@@ -500,7 +500,7 @@ impl KvIndexerInterface for ApproxKvIndexer {
         match resp_rx.await {
             Ok(scores) => Ok(scores),
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     error = ?e,
                     "Approximate indexer match response dropped; the indexer maybe offline"
                 );
