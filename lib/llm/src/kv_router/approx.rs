@@ -541,10 +541,8 @@ impl KvIndexerInterface for ApproxKvIndexer {
 
     fn shutdown(&mut self) {
         self.cancel.cancel();
-        if let Some(task) = self.task.take() {
-            if let Err(err) = task.join() {
-                tracing::error!("Approximate indexer task join failed: {:?}", err);
-            }
+        if let Some(Err(err)) = self.task.take().map(|task| task.join()) {
+            tracing::error!("Approximate indexer task join failed: {:?}", err);
         }
     }
 }
