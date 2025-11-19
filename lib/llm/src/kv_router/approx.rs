@@ -1175,7 +1175,8 @@ mod tests {
     #[cfg(feature = "failpoints")]
     async fn test_approx_indexer_returns_empty_scores_when_radix_tree_panics() {
         let token = CancellationToken::new();
-        let indexer = ApproxKvIndexer::new(token.clone(), KV_BLOCK_SIZE, Duration::from_secs(1), None);
+        let indexer =
+            ApproxKvIndexer::new(token.clone(), KV_BLOCK_SIZE, Duration::from_secs(1), None);
 
         let _guard = PanicResetGuard::new();
         fail::cfg("radix_tree_find_matches_panic", "panic").unwrap();
@@ -1194,7 +1195,8 @@ mod tests {
     #[cfg(feature = "failpoints")]
     async fn test_approx_indexer_shutdown_does_not_panic_after_radix_tree_panic() {
         let token = CancellationToken::new();
-        let mut indexer = ApproxKvIndexer::new(token.clone(), KV_BLOCK_SIZE, Duration::from_secs(1), None);
+        let mut indexer =
+            ApproxKvIndexer::new(token.clone(), KV_BLOCK_SIZE, Duration::from_secs(1), None);
 
         let _guard = PanicResetGuard::new();
         fail::cfg("radix_tree_find_matches_panic", "panic").unwrap();
@@ -1214,7 +1216,8 @@ mod tests {
     #[cfg(feature = "failpoints")]
     async fn test_approx_indexer_returns_empty_scores_when_apply_event_panics() {
         let token = CancellationToken::new();
-        let indexer = ApproxKvIndexer::new(token.clone(), KV_BLOCK_SIZE, Duration::from_secs(1), None);
+        let indexer =
+            ApproxKvIndexer::new(token.clone(), KV_BLOCK_SIZE, Duration::from_secs(1), None);
 
         let _guard = PanicResetGuard::new();
         fail::cfg("radix_tree_apply_event_panic", "panic").unwrap();
@@ -1222,7 +1225,10 @@ mod tests {
         let worker = WorkerWithDpRank::from_worker_id(1);
         let tokens = vec![1, 2, 3, 4];
 
-        indexer.process_routing_decision_for_request(&tokens, worker).await.unwrap();
+        indexer
+            .process_routing_decision_for_request(&tokens, worker)
+            .await
+            .unwrap();
 
         time::sleep(Duration::from_millis(10)).await;
 
