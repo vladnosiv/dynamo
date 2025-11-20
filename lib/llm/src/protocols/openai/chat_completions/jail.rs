@@ -468,6 +468,14 @@ impl JailedStream {
             // Process each item in the stream
             while let Some(response) = stream.next().await {
                 if let Some(chat_response) = response.data.as_ref() {
+
+                    // Handle empty choices (e.g., final usage response)
+                    // These should be passed through as-is
+                    if chat_response.choices.is_empty() {
+                        yield response;
+                        continue;
+                    }
+
                     let mut all_emissions = Vec::new();
 
                     // Process each choice independently using the new architecture

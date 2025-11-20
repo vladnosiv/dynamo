@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 use dynamo_async_openai::types::{
-    ChatChoiceStream, ChatCompletionStreamResponseDelta, FinishReason, Role,
+    ChatChoiceStream, ChatCompletionStreamResponseDelta, CompletionUsage, FinishReason, Role,
 };
 use dynamo_llm::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse;
 use dynamo_llm::protocols::openai::chat_completions::jail::JailedStream;
@@ -215,6 +215,40 @@ mod tests {
                 system_fingerprint: Some("test-fingerprint".to_string()),
                 object: "chat.completion.chunk".to_string(),
                 usage: None,
+                service_tier: None,
+                nvext: None,
+            };
+
+            Annotated {
+                data: Some(response),
+                id: None,
+                event: None,
+                comment: None,
+            }
+        }
+
+        /// Helper function to create a chunk with completion usage
+        pub fn create_usage_chunk(
+            prompt_tokens: u32,
+            completion_tokens: u32,
+            total_tokens: u32,
+        ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+            let usage = CompletionUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            };
+
+            let response = NvCreateChatCompletionStreamResponse {
+                id: "test-id".to_string(),
+                choices: vec![], // Empty choices for usage-only chunk
+                created: 1234567890,
+                model: "test-model".to_string(),
+                system_fingerprint: Some("test-fingerprint".to_string()),
+                object: "chat.completion.chunk".to_string(),
+                usage: Some(usage),
                 service_tier: None,
                 nvext: None,
             };
@@ -2696,5 +2730,52 @@ mod parallel_jail_tests {
             tool_call_count, 0,
             "Should have no tool calls for empty array"
         );
+    }
+
+    #[tokio::test]
+    async fn test_jailed_stream_passes_through_usage_chunk() {
+        // Test that a chunk with usage at the end of the stream passes through unchanged
+        let jail = JailedStream::builder()
+            .jail_start_sequence("<jail>")
+            .jail_end_sequence("</jail>")
+            .build();
+
+        let chunks = vec![
+            test_utils::create_mock_response_chunk("Hello world".to_string(), 0),
+            test_utils::create_final_response_chunk(0), // Final chunk with finish_reason
+            test_utils::create_usage_chunk(100, 50, 150), // Usage chunk at the end
+        ];
+
+        let input_stream = stream::iter(chunks);
+        let results: Vec<_> = jail.apply_with_finish_reason(input_stream).collect().await;
+
+        // Should have 3 chunks: hello world, final chunk, and usage chunk
+        assert_eq!(results.len(), 3, "Should have 3 chunks");
+
+        // First chunk should be the content
+        test_utils::assert_content(&results[0], "Hello world");
+
+        // Second chunk should be the final chunk with finish reason
+        let second_response = results[1].data.as_ref().unwrap();
+        assert_eq!(
+            second_response.choices[0].finish_reason,
+            Some(FinishReason::Stop)
+        );
+
+        // Third chunk should be the usage chunk, passed through unchanged
+        let third_response = results[2].data.as_ref().unwrap();
+        assert!(
+            third_response.choices.is_empty(),
+            "Usage chunk should have no choices"
+        );
+        assert!(
+            third_response.usage.is_some(),
+            "Usage chunk should have usage data"
+        );
+
+        let usage = third_response.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.total_tokens, 150);
     }
 }
