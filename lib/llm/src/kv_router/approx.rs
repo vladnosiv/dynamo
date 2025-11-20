@@ -541,8 +541,9 @@ impl KvIndexerInterface for ApproxKvIndexer {
 
     fn shutdown(&mut self) {
         self.cancel.cancel();
-        if let Some(Err(err)) = self.task.take().map(|task| task.join()) {
-            tracing::error!("Approximate indexer task join failed: {:?}", err);
+        if let Some(task) = self.task.take() {
+            task.join()
+                .expect("Failed to join approximate indexer task");
         }
     }
 }
@@ -556,7 +557,6 @@ impl Drop for ApproxKvIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     use tokio::time::{self, Duration, Instant};
     use tokio_util::sync::CancellationToken;
@@ -590,7 +590,6 @@ mod tests {
 
     /// Validate basic insert / expiry behaviour of [`PruneManager`].
     #[tokio::test]
-    #[serial]
     async fn test_prune_manager_expiry() {
         const TTL: Duration = Duration::from_millis(50);
         let mut pm: PruneManager<u32> = PruneManager::new(TTL, 50, None);
@@ -611,7 +610,6 @@ mod tests {
 
     /// Validate that reinserting an existing key extends its TTL and prevents premature expiry.
     #[tokio::test]
-    #[serial]
     async fn test_prune_manager_update_resets_ttl() {
         // Validate that reinserting an existing key extends its TTL and prevents premature expiry.
         const TTL: Duration = Duration::from_millis(50);
@@ -652,7 +650,6 @@ mod tests {
     ///   2. Matches appear after `process_routing_decision`
     ///   3. Matches disappear after TTL expiry
     #[tokio::test]
-    #[serial]
     async fn test_approx_kv_indexer_basic_flow() {
         const TTL: Duration = Duration::from_millis(200);
         let cancel = CancellationToken::new();
@@ -694,7 +691,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_approx_indexer_find_matches_returns_empty_when_offline() {
         let cancel = CancellationToken::new();
         let mut indexer =
@@ -712,7 +708,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_approx_indexer_find_matches_for_request_returns_empty_when_offline() {
         let cancel = CancellationToken::new();
         let mut indexer =
@@ -730,7 +725,6 @@ mod tests {
 
     /// Verify that `remove_worker` clears all entries for the specified worker.
     #[tokio::test]
-    #[serial]
     async fn test_remove_worker() {
         const TTL: Duration = Duration::from_secs(5); // Large enough to avoid expiry during test
         let cancel = CancellationToken::new();
@@ -769,7 +763,6 @@ mod tests {
 
     /// After removing one of multiple workers that share the same block, the remaining worker's entries should persist.
     #[tokio::test]
-    #[serial]
     async fn test_remove_worker_preserves_other_workers() {
         const TTL: Duration = Duration::from_secs(5); // Large enough to avoid expiry during test
 
@@ -828,7 +821,6 @@ mod tests {
 
     /// Two sequences with a shared prefix should yield overlap scores reflecting the common blocks.
     #[tokio::test]
-    #[serial]
     async fn test_common_prefix_overlap() {
         const TTL: Duration = Duration::from_secs(5);
 
@@ -875,7 +867,6 @@ mod tests {
 
     /// When the same block resides on multiple workers, all should appear in the overlap scores.
     #[tokio::test]
-    #[serial]
     async fn test_multiple_workers_same_block() {
         const TTL: Duration = Duration::from_secs(5);
 
@@ -934,7 +925,6 @@ mod tests {
 
     /// Test that pruning returns empty when tree size is within the max tree size.
     #[tokio::test]
-    #[serial]
     async fn test_prune_manager_no_prune_when_within_bounds() {
         const TTL: Duration = Duration::from_secs(10);
         let prune_config = PruneConfig {
@@ -959,7 +949,6 @@ mod tests {
 
     /// Test that pruning removes the oldest entries first.
     #[tokio::test]
-    #[serial]
     async fn test_prune_manager_prune_removes_oldest_first() {
         const TTL: Duration = Duration::from_secs(10);
         let prune_config = PruneConfig {
@@ -994,7 +983,6 @@ mod tests {
 
     /// Test that pruning fails gracefully when config is None.
     #[tokio::test]
-    #[serial]
     async fn test_prune_manager_prune_fails_without_config() {
         const TTL: Duration = Duration::from_secs(10);
         let mut pm: PruneManager<u32> = PruneManager::new(TTL, 50, None);
@@ -1009,7 +997,6 @@ mod tests {
 
     /// Test that BlockEntry ordering prioritizes sequence position.
     #[test]
-    #[serial]
     fn test_block_entry_ordering() {
         let worker = WorkerWithDpRank::from_worker_id(0);
 
@@ -1036,7 +1023,6 @@ mod tests {
     ///   4. Verify pruning occurred: 4 oldest blocks removed
     ///   5. Verify 2 newest blocks remain
     #[tokio::test]
-    #[serial]
     async fn test_approx_indexer_e2e_pruning() {
         const TTL: Duration = Duration::from_secs(60); // Long TTL to avoid expiry
         let prune_config = PruneConfig {
@@ -1110,7 +1096,6 @@ mod tests {
 
     /// Test that re-inserting a key updates its position in the pruning queue.
     #[tokio::test]
-    #[serial]
     async fn test_prune_manager_prune_reinsertion_updates_position() {
         const TTL: Duration = Duration::from_secs(10);
         let prune_config = PruneConfig {
@@ -1146,91 +1131,5 @@ mod tests {
 
         // Key 1 should still be present (it was refreshed and is now near the end)
         assert!(pm.get_expiry(&1).is_some());
-    }
-
-    #[cfg(feature = "failpoints")]
-    struct PanicResetGuard;
-
-    #[cfg(feature = "failpoints")]
-    impl PanicResetGuard {
-        fn new() -> Self {
-            fail::remove("radix_tree_find_matches_panic");
-            fail::remove("radix_tree_apply_event_panic");
-            Self
-        }
-    }
-
-    #[cfg(feature = "failpoints")]
-    impl Drop for PanicResetGuard {
-        fn drop(&mut self) {
-            fail::remove("radix_tree_find_matches_panic");
-            fail::remove("radix_tree_apply_event_panic");
-        }
-    }
-
-    #[tokio::test]
-    #[serial]
-    #[cfg(feature = "failpoints")]
-    async fn test_approx_indexer_returns_empty_scores_when_radix_tree_panics() {
-        let token = CancellationToken::new();
-        let indexer =
-            ApproxKvIndexer::new(token.clone(), KV_BLOCK_SIZE, Duration::from_secs(1), None);
-
-        let _guard = PanicResetGuard::new();
-        fail::cfg("radix_tree_find_matches_panic", "panic").unwrap();
-
-        let scores = indexer
-            .find_matches(vec![LocalBlockHash(42)])
-            .await
-            .unwrap();
-        assert!(scores.scores.is_empty());
-        assert!(scores.frequencies.is_empty());
-        assert!(scores.tree_sizes.is_empty());
-    }
-
-    #[tokio::test]
-    #[serial]
-    #[cfg(feature = "failpoints")]
-    async fn test_approx_indexer_shutdown_does_not_panic_after_radix_tree_panic() {
-        let token = CancellationToken::new();
-        let mut indexer =
-            ApproxKvIndexer::new(token.clone(), KV_BLOCK_SIZE, Duration::from_secs(1), None);
-
-        let _guard = PanicResetGuard::new();
-        fail::cfg("radix_tree_find_matches_panic", "panic").unwrap();
-
-        let scores = indexer
-            .find_matches(vec![LocalBlockHash(99)])
-            .await
-            .unwrap();
-        assert!(scores.scores.is_empty());
-
-        // Ensures shutdown stays non-panicking even if the background task already crashed.
-        indexer.shutdown();
-    }
-
-    #[tokio::test]
-    #[serial]
-    #[cfg(feature = "failpoints")]
-    async fn test_approx_indexer_returns_empty_scores_when_apply_event_panics() {
-        let token = CancellationToken::new();
-        let indexer =
-            ApproxKvIndexer::new(token.clone(), KV_BLOCK_SIZE, Duration::from_secs(1), None);
-
-        let _guard = PanicResetGuard::new();
-        fail::cfg("radix_tree_apply_event_panic", "panic").unwrap();
-
-        let worker = WorkerWithDpRank::from_worker_id(1);
-        let tokens = vec![1, 2, 3, 4];
-
-        indexer
-            .process_routing_decision_for_request(&tokens, worker)
-            .await
-            .unwrap();
-
-        time::sleep(Duration::from_millis(10)).await;
-
-        let scores = indexer.find_matches(vec![LocalBlockHash(1)]).await.unwrap();
-        assert!(scores.scores.is_empty());
     }
 }

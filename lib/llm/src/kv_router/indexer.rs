@@ -282,11 +282,6 @@ impl RadixTree {
         let mut current = self.root.clone();
         let now = Instant::now();
 
-        #[cfg(feature = "failpoints")]
-        fail::fail_point!("radix_tree_find_matches_panic", |_| panic!(
-            "Forced RadixTree panic on find_matches for tests"
-        ));
-
         tracing::trace!(
             "RadixTree::find_matches: looking for sequence={:?}",
             sequence.iter().map(|h| h.0).collect::<Vec<_>>()
@@ -352,11 +347,6 @@ impl RadixTree {
     pub fn apply_event(&mut self, event: RouterEvent) -> Result<(), KvCacheEventError> {
         let (worker_id, kv_event) = (event.worker_id, event.event);
         let (id, op) = (kv_event.event_id, kv_event.data);
-
-        #[cfg(feature = "failpoints")]
-        fail::fail_point!("radix_tree_apply_event_panic", |_| panic!(
-            "Forced RadixTree panic on apply_event for tests"
-        ));
 
         // Construct WorkerWithDpRank from worker_id and dp_rank from the event
         let worker = WorkerWithDpRank::new(worker_id, kv_event.dp_rank);
@@ -1047,8 +1037,8 @@ impl KvIndexerInterface for KvIndexer {
 
     fn shutdown(&mut self) {
         self.cancel.cancel();
-        if let Some(Err(err)) = self.task.take().map(|task| task.join()) {
-            tracing::error!("Failed to join kv indexer task: {:?}", err);
+        if let Some(task) = self.task.take() {
+            task.join().expect("Failed to join kv indexer task");
         }
     }
 
@@ -1375,32 +1365,11 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use rstest_reuse::{self, *};
-    use serial_test::serial;
     use tokio::time;
     use tokio_util::sync::CancellationToken;
 
     fn setup() {
         dynamo_runtime::logging::init();
-    }
-
-    #[cfg(feature = "failpoints")]
-    struct PanicResetGuard;
-
-    #[cfg(feature = "failpoints")]
-    impl PanicResetGuard {
-        fn new() -> Self {
-            fail::remove("radix_tree_find_matches_panic");
-            fail::remove("radix_tree_apply_event_panic");
-            Self
-        }
-    }
-
-    #[cfg(feature = "failpoints")]
-    impl Drop for PanicResetGuard {
-        fn drop(&mut self) {
-            fail::remove("radix_tree_find_matches_panic");
-            fail::remove("radix_tree_apply_event_panic");
-        }
     }
 
     fn make_blocks(hashes: Vec<u64>) -> Vec<KvCacheStoredBlockData> {
@@ -1456,7 +1425,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_radix_tree() {
         setup();
 
@@ -1751,7 +1719,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_radix_tree_apply_event_errors() {
         let mut trie = RadixTree::new();
         let worker_0 = 0;
@@ -1779,7 +1746,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_remove_worker() {
         setup();
         let mut trie = RadixTree::new();
@@ -1812,7 +1778,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_clear_all_blocks() {
         let mut trie = RadixTree::new();
 
@@ -1945,7 +1910,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_early_stopping() {
         setup();
         let mut trie = RadixTree::new();
@@ -1982,7 +1946,6 @@ mod tests {
     }
 
     #[rstest]
-    #[serial]
     #[case(11)]
     #[case(32)]
     #[case(64)]
@@ -2024,7 +1987,6 @@ mod tests {
 
     #[template]
     #[rstest]
-    #[serial]
     fn indexer_template(
         #[values(1, 3, 8)] num_shards: usize,
         #[values(11, 32, 64)] kv_block_size: usize,
@@ -2033,7 +1995,6 @@ mod tests {
 
     #[tokio::test]
     #[apply(indexer_template)]
-    #[serial]
     async fn test_kv_indexer_new(num_shards: usize, kv_block_size: u32) {
         setup();
         let token: CancellationToken = CancellationToken::new();
@@ -2042,7 +2003,6 @@ mod tests {
 
     #[tokio::test]
     #[apply(indexer_template)]
-    #[serial]
     async fn test_find_matches(num_shards: usize, kv_block_size: u32) {
         setup();
         let token = CancellationToken::new();
@@ -2056,7 +2016,6 @@ mod tests {
 
     #[tokio::test]
     #[apply(indexer_template)]
-    #[serial]
     async fn test_find_matches_for_request(num_shards: usize, kv_block_size: u32) {
         setup();
         let token = CancellationToken::new();
@@ -2070,7 +2029,6 @@ mod tests {
 
     #[tokio::test]
     #[apply(indexer_template)]
-    #[serial]
     async fn test_apply_event(num_shards: usize, kv_block_size: u32) {
         setup();
         let worker_id = 0;
@@ -2086,7 +2044,6 @@ mod tests {
 
     #[tokio::test]
     #[apply(indexer_template)]
-    #[serial]
     async fn test_shutdown(num_shards: usize, kv_block_size: u32) {
         setup();
         let token = CancellationToken::new();
@@ -2097,7 +2054,6 @@ mod tests {
 
     #[tokio::test]
     #[apply(indexer_template)]
-    #[serial]
     async fn test_frequency(num_shards: usize, kv_block_size: u32) {
         const ONE_MILLIS: Duration = Duration::from_millis(1);
 
@@ -2201,7 +2157,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_kv_indexer_returns_empty_scores_when_offline() {
         setup();
         let metrics = Arc::new(KvIndexerMetrics::new_unregistered());
@@ -2217,73 +2172,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
-    #[cfg(feature = "failpoints")]
-    async fn test_kv_indexer_returns_empty_scores_when_radix_tree_panics() {
-        setup();
-        let metrics = Arc::new(KvIndexerMetrics::new_unregistered());
-        let token = CancellationToken::new();
-        let indexer = KvIndexer::new(token.clone(), 32, metrics);
-
-        let _guard = PanicResetGuard::new();
-        fail::cfg("radix_tree_find_matches_panic", "panic").unwrap();
-
-        let scores = indexer
-            .find_matches(vec![LocalBlockHash(42)])
-            .await
-            .unwrap();
-        assert!(scores.scores.is_empty());
-        assert!(scores.frequencies.is_empty());
-        assert!(scores.tree_sizes.is_empty());
-    }
-
-    #[tokio::test]
-    #[serial]
-    #[cfg(feature = "failpoints")]
-    async fn test_kv_indexer_returns_empty_scores_when_apply_event_panics() {
-        setup();
-        let metrics = Arc::new(KvIndexerMetrics::new_unregistered());
-        let token = CancellationToken::new();
-        let mut indexer = KvIndexer::new(token.clone(), 32, metrics);
-
-        let _guard = PanicResetGuard::new();
-        fail::cfg("radix_tree_apply_event_panic", "panic").unwrap();
-
-        let event = create_store_event(0, 1, vec![1], None);
-        indexer.apply_event(event).await;
-
-        time::sleep(Duration::from_millis(10)).await;
-
-        let scores = indexer.find_matches(vec![LocalBlockHash(1)]).await.unwrap();
-        assert!(scores.scores.is_empty());
-        assert!(scores.frequencies.is_empty());
-        assert!(scores.tree_sizes.is_empty());
-    }
-
-    #[tokio::test]
-    #[serial]
-    #[cfg(feature = "failpoints")]
-    async fn test_kv_indexer_shutdown_does_not_panic_after_radix_tree_panic() {
-        setup();
-        let metrics = Arc::new(KvIndexerMetrics::new_unregistered());
-        let token = CancellationToken::new();
-        let mut indexer = KvIndexer::new(token.clone(), 32, metrics);
-
-        let _guard = PanicResetGuard::new();
-        fail::cfg("radix_tree_find_matches_panic", "panic").unwrap();
-
-        let scores = indexer
-            .find_matches(vec![LocalBlockHash(99)])
-            .await
-            .unwrap();
-        assert!(scores.scores.is_empty());
-
-        // Ensures shutdown stays non-panicking even if the background task already crashed.
-        indexer.shutdown();
-    }
-
-    #[tokio::test]
-    #[serial]
     async fn test_kv_indexer_sharded_returns_empty_scores_when_offline() {
         setup();
         let metrics = Arc::new(KvIndexerMetrics::new_unregistered());
@@ -2299,7 +2187,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_router_event_new() {
         setup();
         let worker_id = 0;
@@ -2331,7 +2218,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_radix_tree_default() {
         setup();
         let radix_tree: RadixTree = Default::default();
@@ -2341,7 +2227,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_overlap_scores_default() {
         setup();
         let overlap_scores: OverlapScores = Default::default();
@@ -2349,7 +2234,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_dump_tree_as_events_round_trip() {
         setup();
 
@@ -2525,7 +2409,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_increment_event_applied() {
         let metrics = KvIndexerMetrics::new_unregistered();
 
@@ -2571,7 +2454,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_remove_worker_verifies_hash_removal() {
         setup();
         let mut trie = RadixTree::new();
