@@ -398,10 +398,19 @@ pub fn encode_messages(
         prompt.push_str(tokens::BOS);
     }
 
-    let last_user_idx = find_last_user_index(messages);
+    let mut messages_vec = messages.to_vec();
+    let last_user_idx = find_last_user_index(&messages_vec);
 
-    for (index, _) in messages.iter().enumerate() {
-        let msg_prompt = render_message(index, messages, thinking_mode, last_user_idx)?;
+    if let Some(last_user_idx) = last_user_idx {
+        for msg in messages_vec.iter_mut().take(last_user_idx) {
+            if let Some(obj) = msg.as_object_mut() {
+                obj.remove("reasoning_content");
+            }
+        }
+    }
+
+    for (index, _) in messages_vec.iter().enumerate() {
+        let msg_prompt = render_message(index, &messages_vec, thinking_mode, last_user_idx)?;
         prompt.push_str(&msg_prompt);
     }
 

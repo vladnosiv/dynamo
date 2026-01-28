@@ -278,6 +278,25 @@ fn test_with_reasoning_content() {
 }
 
 #[test]
+fn test_reasoning_content_stripped_before_last_user() {
+    let messages = serde_json::json!([
+        {"role": "user", "content": "First question"},
+        {
+            "role": "assistant",
+            "content": "First answer.",
+            "reasoning_content": "Internal reasoning for the first answer."
+        },
+        {"role": "user", "content": "Second question"}
+    ]);
+
+    let result = encode_messages(messages.as_array().unwrap(), ThinkingMode::Thinking, true)
+        .expect("Failed to encode");
+
+    assert!(result.contains("First answer."));
+    assert!(!result.contains("Internal reasoning for the first answer."));
+}
+
+#[test]
 fn test_tool_call_formatting() {
     let messages = serde_json::json!([
         {"role": "user", "content": "What's the weather in Beijing?"},
