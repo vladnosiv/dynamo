@@ -66,8 +66,8 @@ pub enum SequenceError {
     WorkerChannelClosed,
 }
 
-/// Duration after which stale requests are forcibly expired (5 minutes)
-const EXPIRY_DURATION: Duration = Duration::from_secs(300);
+/// Duration after which stale requests are forcibly expired (90 minutes)
+const EXPIRY_DURATION: Duration = Duration::from_secs(90 * 60);
 
 // TODO: use the common request_id if it exists in the repo
 pub type RequestId = String;
