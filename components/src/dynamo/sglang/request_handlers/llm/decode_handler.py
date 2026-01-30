@@ -72,7 +72,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 "temperature": sampling_opts.get("temperature"),
                 "top_p": sampling_opts.get("top_p"),
                 "top_k": sampling_opts.get("top_k"),
-                "max_new_tokens": stop_conditions.get("max_tokens"),
+                "max_new_tokens": stop_conditions.get("max_tokens", 32000),
                 "ignore_eos": stop_conditions.get("ignore_eos"),
             }
         else:
