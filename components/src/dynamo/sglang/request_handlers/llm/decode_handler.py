@@ -216,6 +216,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         """
         # Use Future pattern for request ID - will be set when first response arrives
         request_id_future = asyncio.Future()
+        observed_tokens = 0
         async with self._cancellation_monitor(request_id_future, context):
             async for res in stream_source:
                 # Extract SGLang request ID from the first response and set the future
@@ -246,6 +247,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         break
                     continue
 
+                observed_tokens += len(output_ids)
+
                 # Pass through disjoint token segments directly
                 out["token_ids"] = output_ids
                 routed_experts = res["meta_info"].get("routed_experts")
@@ -260,6 +263,18 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     input_tokens = res["meta_info"]["prompt_tokens"]
                     completion_tokens = res["meta_info"]["completion_tokens"]
                     cached_tokens = res["meta_info"]["cached_tokens"]
+                    if observed_tokens != completion_tokens:
+                        logging.error(
+                            "Token count mismatch: observed %d tokens in stream "
+                            "but SGLang reported completion_tokens=%d "
+                            "(rid=%s, delta=%d). "
+                            "Streaming data loss: %d token(s) were generated "
+                            "but never delivered to the client.",
+                            observed_tokens,
+                            completion_tokens,
+                            res["meta_info"].get("id", "unknown"),
+                            completion_tokens - observed_tokens,
+                        )
                     prefill_prompt_tokens_details = None
                     if cached_tokens is not None and cached_tokens > 0:
                         prefill_prompt_tokens_details = {"cached_tokens": cached_tokens}
