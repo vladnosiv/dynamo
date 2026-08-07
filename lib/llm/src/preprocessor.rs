@@ -2797,6 +2797,12 @@ impl OpenAIPreprocessor {
                 Box::pin(stream)
             };
 
+        let transformed_stream = Box::pin(
+            crate::protocols::openai::chat_completions::stop_split::apply_stream(
+                transformed_stream,
+            ),
+        );
+
         Ok(transformed_stream)
     }
 
