@@ -94,6 +94,14 @@ pub(super) fn validate_offline_replay_args(
     router_mode: ReplayRouterMode,
     scaling_enabled: bool,
 ) -> Result<()> {
+    let hicache_enabled = args
+        .sglang
+        .as_ref()
+        .and_then(|sglang| sglang.hicache.as_ref())
+        .is_some();
+    if hicache_enabled && router_mode != ReplayRouterMode::KvRouter {
+        bail!("SGLang HiCache replay requires router_mode=kv_router");
+    }
     validate_offline_router_mode(router_mode, num_workers, args.dp_size, scaling_enabled)?;
     validate_replay_args(args, num_workers, "trace replay", true)
 }
@@ -107,6 +115,14 @@ pub(super) fn validate_offline_concurrency_args(
 ) -> Result<()> {
     if max_in_flight == 0 {
         bail!("concurrency replay requires max_in_flight >= 1");
+    }
+    let hicache_enabled = args
+        .sglang
+        .as_ref()
+        .and_then(|sglang| sglang.hicache.as_ref())
+        .is_some();
+    if hicache_enabled && router_mode != ReplayRouterMode::KvRouter {
+        bail!("SGLang HiCache replay requires router_mode=kv_router");
     }
 
     validate_offline_router_mode(router_mode, num_workers, args.dp_size, scaling_enabled)?;
@@ -132,6 +148,14 @@ pub(super) fn validate_online_concurrency_args(
 }
 
 fn validate_online_kv_offload(args: &MockEngineArgs) -> Result<()> {
+    if args
+        .sglang
+        .as_ref()
+        .and_then(|sglang| sglang.hicache.as_ref())
+        .is_some()
+    {
+        bail!("SGLang HiCache is currently supported only by offline aggregated replay");
+    }
     if args.num_g3_blocks.is_some() || args.enable_g4_storage {
         bail!(
             "online replay does not support G3 or G4 KV offload; only G1/G2 offload is supported"
@@ -141,6 +165,17 @@ fn validate_online_kv_offload(args: &MockEngineArgs) -> Result<()> {
 }
 
 fn validate_disagg_args(config: &OfflineDisaggReplayConfig, mode: &str) -> Result<()> {
+    let hicache_enabled = [&config.prefill_args, &config.decode_args]
+        .into_iter()
+        .any(|args| {
+            args.sglang
+                .as_ref()
+                .and_then(|sglang| sglang.hicache.as_ref())
+                .is_some()
+        });
+    if hicache_enabled {
+        bail!("SGLang HiCache is currently supported only by offline aggregated replay");
+    }
     if config.prefill_args.engine_type == EngineType::Trtllm
         || config.decode_args.engine_type == EngineType::Trtllm
     {

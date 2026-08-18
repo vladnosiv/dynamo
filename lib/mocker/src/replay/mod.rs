@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::common::protocols::{DirectRequest, MockEngineArgs};
 use dynamo_kv_router::PrefillLoadEstimator;
+use dynamo_kv_router::config::KvRouterConfig;
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -26,10 +27,11 @@ pub(crate) use collector::TraceCollector;
 #[cfg(test)]
 pub(crate) use collector::TraceRequestStatsSnapshot;
 pub use collector::{
-    PerRequestAdmissionRecord, PerRequestRecord, PerRequestRoutingRecord, ReplayRequestPool,
-    ReplayRoutingOutcome, ReplayTerminalStatus, SlaThresholds, TraceDistributionStats,
-    TraceGoodputStats, TraceInterTokenLatencyStats, TraceLatencyStats, TraceRequestCounts,
-    TraceSimulationReport, TraceThroughputStats,
+    DistanceToIdeal, IdealL1Totals, IdealL1ZeroQueueReport, PerRequestAdmissionRecord,
+    PerRequestRecord, PerRequestRoutingRecord, ReplayRequestPool, ReplayRoutingOutcome,
+    ReplayTerminalStatus, SlaThresholds, TraceDistributionStats, TraceGoodputStats,
+    TraceInterTokenLatencyStats, TraceLatencyStats, TraceRequestCounts, TraceSimulationReport,
+    TraceThroughputStats,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplayRouterMode {
@@ -180,6 +182,18 @@ pub use offline::{
     canonical_router_metadata, canonical_topology, with_runtime_evidence,
 };
 pub use validate::validate_replay_args_mode;
+
+/// Resolve the same router defaults used by replay before recording canonical
+/// metadata. This keeps provenance aligned with runtime-only defaults such as
+/// SGLang HiCache shared-prefix credit.
+pub fn canonical_router_metadata_for_args(
+    mode: ReplayRouterMode,
+    router_config: Option<&KvRouterConfig>,
+    args: &MockEngineArgs,
+) -> anyhow::Result<CanonicalRouterMetadata> {
+    let effective = router_shared::replay_router_config(args, router_config.cloned());
+    canonical_router_metadata(mode, Some(&effective))
+}
 
 pub(crate) fn normalize_trace_requests(
     mut requests: Vec<DirectRequest>,

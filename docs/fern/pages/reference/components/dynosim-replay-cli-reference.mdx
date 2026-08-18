@@ -231,6 +231,66 @@ explicit class bypasses cache bucketing. Missing, unknown, and ordinary physical
 selected profile's `default_policy_family`. For the YAML schema and queue behavior, see
 [Router Configuration](../../developer-guide/knowledge-base/modular-components/router/configuration-and-tuning.md#policy-class-queues).
 
+### Experimental SGLang HiCache fields
+
+Offline aggregated SGLang replay can model worker-local L2 plus one shared Mooncake-like L3. The
+current experiment requires `router_mode=kv_router`; online and disaggregated replay reject this
+configuration.
+
+Configure HiCache inside `sglang` in `--extra-engine-args`. The ordinary DynoSim fields describe the
+FULL KV representation: `block_size` is its token granularity, `num_gpu_blocks` is L1 FULL capacity,
+and `kv_bytes_per_token * block_size` is its physical size. HiCache adds worker-local L2 capacity,
+one periodic SWA checkpoint sidecar, shared-L3 capacity, and calibrated host IO. This four-worker
+example gives the shared L3 `4 * 256 GiB`:
+
+```json
+{
+  "engine_type": "sglang",
+  "block_size": 256,
+  "num_gpu_blocks": 53108,
+  "kv_bytes_per_token": 3899,
+  "sglang": {
+    "page_size": 256,
+    "hicache": {
+      "write_policy": "write_back",
+      "l2_capacity_blocks": 212432,
+      "l1_checkpoint_capacity": 5310,
+      "l2_checkpoint_capacity": 21240,
+      "swa_checkpoint": {
+        "interval_tokens": 256,
+        "bytes": 8160000
+      },
+      "l3_capacity_gib": 1024,
+      "io_tokens_per_second": 160000
+    }
+}
+```
+
+`swa_checkpoint.interval_tokens` must be a multiple of `block_size`. A prefix is reusable only
+through the last checkpoint whose preceding FULL chain is resident. `l1_checkpoint_capacity` and
+`l2_checkpoint_capacity` count independently evictable checkpoint sidecars; `bytes` affects
+byte-hard L3 accounting. For the current SGLang UnifiedRadixCache configuration, a checkpoint is
+inserted every 256 tokens, but the schema supports any block-aligned interval.
+
+`write_through` backs up each FULL block when its device store becomes visible and includes the
+checkpoint sidecar at configured boundaries. `write_back` waits for device eviction and backs up the
+FULL block plus its checkpoint only if that checkpoint is still resident. In both modes, L3 receives
+only successful L2 backups. L3 evicts one logical block group at a time: the FULL block and its
+optional checkpoint sidecar leave together.
+
+`io_tokens_per_second` is an effective calibrated lower-tier rate that includes PCIe constraints and
+observed scheduler stalls, not raw link bandwidth. Every block loaded back into L1 accrues H2D debt;
+L3-to-L2 staging is not charged separately so the calibrated rate is not counted twice. Debt is
+serialized per worker and added to its next scheduler pass. Set `l3_capacity_gib` to `0` for a
+local-L2-only control while keeping the same WT/WB and host-IO accounting.
+
+Shared-prefix presence reaches the existing KV-router scoring path through `shared_cache_hits`. When
+`--router-config` is omitted, HiCache replay uses `shared_cache_multiplier=0.5`; an explicit router
+config remains authoritative. Ordinary SGLang KV events describe FULL blocks but not independent SWA
+checkpoint eviction. DynoSim therefore carries checkpoint lifecycle in a simulator-private ordered
+sideband and intercepts it before the ordinary KV indexer; checkpoint events never become router KV
+blocks or scores.
+
 ### Engine-timing AIC fields (engine-args JSON)
 
 Set inside `--extra-engine-args` (or the staged prefill/decode engine args) to drive the simulated
@@ -331,6 +391,8 @@ Additional offline constraints:
 - single-worker offline mode is a dedicated fast path for `vllm`, `sglang`, and `trtllm`;
   it supports flat request runs and workload-driven multi-turn runs
 - offline disaggregated simulation is a separate two-stage runtime with prefill and decode worker pools
+- SGLang HiCache requires aggregated offline `kv_router`, `block_size=256`, and page-aligned L1/L2
+  capacities
 
 Additional online constraints:
 
@@ -348,6 +410,24 @@ The report — and the equivalent Python APIs `dynamo.replay.run_trace_replay(..
 - prefix cache reuse ratio
 - TTFT, TTST, TPOT, ITL, and end-to-end latency summaries
 - output-token-throughput-per-user summaries
+
+SGLang aggregated reports additionally include `ideal_l1_zero_queue`. This trace-data reference
+keeps every complete page from strictly earlier timestamp buckets in an unbounded L1, preserves the
+production `input_tokens - 1` page clamp, and removes queue and transfer time. Its isolated TTFT uses
+the configured SGLang performance model, chunked-prefill budget, speedup factors, and first decode
+step. The nested `distance` object reports realized hit-rate and p99 TTFT gaps plus per-request TTFT
+excess.
+
+When HiCache is enabled, `sglang_hicache` records FULL-block and SWA-checkpoint geometry, per-worker
+L2 capacities and final occupancy, calibrated IO rate, D2H/H2D token traffic, and byte-hard shared-L3
+occupancy, insertion, rejection, and group-eviction counters. Its `route_*` fields are the
+request-level cache potential immediately after the selected worker has been hydrated;
+`admission_*` records what remains when the scheduler actually starts the request and is the reuse
+value compared with `ideal_l1_zero_queue`. The difference exposes queue-time eviction or capacity
+loss after routing. Prefer `admission_token_hit_rate` for realized HiCache experiments. The legacy
+top-level `prefix_cache_reused_ratio` takes the maximum over all scheduler admissions, so a chunked
+prefill can count chunks computed earlier by the same request; with HiCache enabled,
+`first_admission_prefix_cache_reused_ratio` now matches the admission-level value.
 
 ## Related pages
 

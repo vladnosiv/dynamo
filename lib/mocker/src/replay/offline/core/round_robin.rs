@@ -82,6 +82,7 @@ where
                 scheduler_id,
                 reported_overlap_tokens: 0,
                 planner_cache_sample: None,
+                hicache_target_pages: 0,
             }),
             released: Vec::new(),
         })
@@ -187,6 +188,7 @@ where
                 scheduler_id,
                 reported_overlap_tokens: 0,
                 planner_cache_sample: None,
+                hicache_target_pages: 0,
             }),
             released: Vec::new(),
         })

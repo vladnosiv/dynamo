@@ -9,6 +9,7 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 use uuid::Uuid;
 
 use crate::common::protocols::OutputSignal;
+use crate::kv_manager::SglangHiCacheReport;
 use crate::scheduler::EnginePassResult;
 
 // 0.1% relative quantile error. The enlarged store covers latency/rate values
@@ -28,6 +29,11 @@ pub struct TraceSimulationReport {
     /// (via `set_sla_thresholds`); `None` otherwise — goodput is undefined
     /// without an SLA, so the `goodput_*` keys are omitted from the report.
     pub goodput: Option<TraceGoodputStats>,
+    /// Final SGLang HiCache geometry, capacity, traffic, and L3 state.
+    pub sglang_hicache: Option<SglangHiCacheReport>,
+    /// Trace-data latency reference for SGLang aggregated replay. The ideal
+    /// worker has an unbounded historical L1 and no queue or transfer delay.
+    pub ideal_l1_zero_queue: Option<IdealL1ZeroQueueReport>,
     /// Per-request records, one per admitted request. Populated by
     /// `TraceCollector::finish`. Intentionally NOT serialized into the summary
     /// JSON (see custom `Serialize` impl below) — consumers that want per-
@@ -91,7 +97,7 @@ pub struct TraceGoodputStats {
     pub output_throughput_tok_s: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TraceDistributionStats {
     pub mean_ms: f64,
     pub min_ms: f64,
@@ -102,6 +108,33 @@ pub struct TraceDistributionStats {
     pub p95_ms: f64,
     pub p99_ms: f64,
     pub std_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IdealL1ZeroQueueReport {
+    pub history_policy: String,
+    pub timing_policy: String,
+    pub queue_time_ms: f64,
+    pub totals: IdealL1Totals,
+    pub ttft: TraceDistributionStats,
+    pub distance: DistanceToIdeal,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IdealL1Totals {
+    pub input_tokens: usize,
+    pub reusable_tokens: usize,
+    pub recomputed_tokens: usize,
+    pub token_hit_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DistanceToIdeal {
+    pub token_hit_rate_gap: f64,
+    pub p99_ttft_gap_ms: f64,
+    pub p99_ttft_over_bound: f64,
+    pub per_request_ttft_excess: TraceDistributionStats,
+    pub requests_below_isolated_bound: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +296,12 @@ impl Serialize for TraceSimulationReport {
                 &goodput.output_throughput_tok_s,
             )?;
         }
+        if let Some(hicache) = &self.sglang_hicache {
+            map.serialize_entry("sglang_hicache", hicache)?;
+        }
+        if let Some(ideal) = &self.ideal_l1_zero_queue {
+            map.serialize_entry("ideal_l1_zero_queue", ideal)?;
+        }
         map.serialize_entry("processed_tokens", &self.processed_tokens())?;
         map.serialize_entry("processed_tokens_per_s", &self.processed_tokens_per_s())?;
         map.serialize_entry(
@@ -340,6 +379,11 @@ struct TraceRequestStats {
     requested_output_length: usize,
     reused_input_tokens: usize,
     first_admission_reused_input_tokens: usize,
+    /// Reusable prompt tokens present on the selected worker immediately after
+    /// HiCache hydration. Unlike scheduler admission reuse, this is not
+    /// distorted by chunked-prefill self-reuse.
+    sglang_hicache_route_reused_input_tokens: Option<usize>,
+    ideal_l1: Option<IdealL1RequestBound>,
     /// Index of the prefill worker that handled this request, if any.
     /// `None` in two situations:
     ///   - Aggregated replay (no separate prefill pool) — meaningless field.
@@ -357,6 +401,13 @@ struct TraceRequestStats {
     session_id: Option<String>,
     turn_index: Option<usize>,
     detail: Option<Box<PerRequestDetail>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IdealL1RequestBound {
+    pub(crate) reusable_tokens: usize,
+    pub(crate) recomputed_tokens: usize,
+    pub(crate) ttft_ms: f64,
 }
 
 #[derive(Debug)]
@@ -564,6 +615,11 @@ pub struct PerRequestRecord {
     /// Number of output tokens actually emitted by the mock engine.
     pub output_length: usize,
     pub reused_input_tokens: usize,
+    pub sglang_hicache_route_reused_input_tokens: Option<usize>,
+    pub ideal_l1_reused_input_tokens: Option<usize>,
+    pub ideal_l1_recomputed_input_tokens: Option<usize>,
+    pub ideal_l1_zero_queue_ttft_ms: Option<f64>,
+    pub ttft_excess_over_ideal_ms: Option<f64>,
     pub prefill_worker_idx: Option<usize>,
     pub decode_worker_idx: Option<usize>,
     pub prefill_admit_ms: Option<f64>,
@@ -685,6 +741,8 @@ pub(crate) struct TraceCollector {
     /// `finish()` to turn worker-seconds into gpu_hours.
     prefill_gpus_per_worker: usize,
     decode_gpus_per_worker: usize,
+    sglang_hicache: Option<SglangHiCacheReport>,
+    sglang_hicache_h2d_tokens: u64,
 }
 
 impl TraceRequestStats {
@@ -814,6 +872,71 @@ impl TraceCollector {
         self.decode_gpus_per_worker = decode;
     }
 
+    pub(crate) fn set_sglang_hicache_report(&mut self, report: Option<SglangHiCacheReport>) {
+        self.sglang_hicache = report.map(|mut report| {
+            report.h2d_tokens = self.sglang_hicache_h2d_tokens;
+            report.total_host_io_tokens = report.d2h_tokens.saturating_add(report.h2d_tokens);
+            let (route_input_tokens, route_reused_tokens) = self
+                .requests
+                .values()
+                .filter(|stats| stats.terminal_status == Some(ReplayTerminalStatus::Completed))
+                .fold((0_u64, 0_u64), |(input, reused), stats| {
+                    (
+                        input.saturating_add(u64::try_from(stats.input_length).unwrap_or(u64::MAX)),
+                        reused.saturating_add(
+                            u64::try_from(
+                                stats.sglang_hicache_route_reused_input_tokens.unwrap_or(0),
+                            )
+                            .unwrap_or(u64::MAX),
+                        ),
+                    )
+                });
+            report.route_input_tokens = route_input_tokens;
+            report.route_reused_tokens = route_reused_tokens;
+            report.route_recomputed_tokens = route_input_tokens.saturating_sub(route_reused_tokens);
+            report.route_token_hit_rate = if route_input_tokens == 0 {
+                0.0
+            } else {
+                route_reused_tokens as f64 / route_input_tokens as f64
+            };
+            let (admission_input_tokens, admission_reused_tokens) = self
+                .requests
+                .values()
+                .filter(|stats| stats.terminal_status == Some(ReplayTerminalStatus::Completed))
+                .fold((0_u64, 0_u64), |(input, reused), stats| {
+                    (
+                        input.saturating_add(u64::try_from(stats.input_length).unwrap_or(u64::MAX)),
+                        reused.saturating_add(
+                            u64::try_from(stats.first_admission_reused_input_tokens)
+                                .unwrap_or(u64::MAX),
+                        ),
+                    )
+                });
+            report.admission_input_tokens = admission_input_tokens;
+            report.admission_reused_tokens = admission_reused_tokens;
+            report.admission_recomputed_tokens =
+                admission_input_tokens.saturating_sub(admission_reused_tokens);
+            report.admission_token_hit_rate = if admission_input_tokens == 0 {
+                0.0
+            } else {
+                admission_reused_tokens as f64 / admission_input_tokens as f64
+            };
+            report
+        });
+    }
+
+    pub(crate) fn add_sglang_hicache_h2d_tokens(&mut self, tokens: usize) {
+        self.sglang_hicache_h2d_tokens = self
+            .sglang_hicache_h2d_tokens
+            .saturating_add(u64::try_from(tokens).unwrap_or(u64::MAX));
+    }
+
+    pub(crate) fn on_sglang_hicache_route_reuse(&mut self, uuid: Uuid, tokens: usize) {
+        if let Some(stats) = self.requests.get_mut(&uuid) {
+            stats.sglang_hicache_route_reused_input_tokens = Some(tokens);
+        }
+    }
+
     pub(crate) fn on_arrival(
         &mut self,
         uuid: Uuid,
@@ -832,6 +955,8 @@ impl TraceCollector {
                 input_length,
                 requested_output_length,
                 reused_input_tokens: 0,
+                sglang_hicache_route_reused_input_tokens: None,
+                ideal_l1: None,
                 prefill_worker_idx: None,
                 decode_worker_idx: None,
                 session_id: None,
@@ -895,6 +1020,12 @@ impl TraceCollector {
                 stats.first_admit_ms = Some(admit_time_ms);
             }
             stats.reused_input_tokens = stats.reused_input_tokens.max(reused_input_tokens);
+        }
+    }
+
+    pub(crate) fn on_ideal_l1_bound(&mut self, uuid: Uuid, bound: IdealL1RequestBound) {
+        if let Some(stats) = self.requests.get_mut(&uuid) {
+            stats.ideal_l1 = Some(bound);
         }
     }
 
@@ -1261,6 +1392,7 @@ impl TraceCollector {
         let accumulated_decode_worker_seconds = self.decode_worker_seconds;
         let prefill_gpus_per_worker = self.prefill_gpus_per_worker;
         let decode_gpus_per_worker = self.decode_gpus_per_worker;
+        let sglang_hicache = self.sglang_hicache.clone();
         let itl_distribution = self.itl_distribution.finish();
         let output_token_throughput_per_user = self.output_token_throughput_per_user.finish();
         let requests = self.requests;
@@ -1349,6 +1481,18 @@ impl TraceCollector {
             request_throughput_rps: goodput_requests as f64 / duration_s,
             output_throughput_tok_s: goodput_output_tokens as f64 / duration_s,
         });
+        let realized_hit_rate = if total_input_tokens == 0 {
+            0.0
+        } else {
+            total_reused_tokens as f64 / total_input_tokens as f64
+        };
+        let actual_ttft = build_distribution_stats(ttfts);
+        let ideal_comparison_hit_rate = sglang_hicache
+            .as_ref()
+            .map(|report| report.admission_token_hit_rate)
+            .unwrap_or(realized_hit_rate);
+        let ideal_l1_zero_queue =
+            build_ideal_l1_report(&requests, ideal_comparison_hit_rate, &actual_ttft);
         TraceSimulationReport {
             request_counts: TraceRequestCounts {
                 num_requests: request_count,
@@ -1370,18 +1514,14 @@ impl TraceCollector {
                 decode_gpus_per_worker,
                 gpu_hours,
             },
-            prefix_cache_reused_ratio: if total_input_tokens == 0 {
-                0.0
-            } else {
-                total_reused_tokens as f64 / total_input_tokens as f64
-            },
+            prefix_cache_reused_ratio: realized_hit_rate,
             first_admission_prefix_cache_reused_ratio: if total_input_tokens == 0 {
                 0.0
             } else {
                 total_first_admission_reused_tokens as f64 / total_input_tokens as f64
             },
             latency: TraceLatencyStats {
-                ttft: build_distribution_stats(ttfts),
+                ttft: actual_ttft,
                 ttst: build_distribution_stats(ttsts),
                 tpot: build_distribution_stats(tpots),
                 itl: TraceInterTokenLatencyStats {
@@ -1392,6 +1532,8 @@ impl TraceCollector {
                 output_token_throughput_per_user,
             },
             goodput,
+            sglang_hicache,
+            ideal_l1_zero_queue,
             per_request,
         }
     }
@@ -1435,6 +1577,18 @@ impl TraceCollector {
                 reused_input_tokens: detail
                     .prefill_reused_input_tokens
                     .unwrap_or(stats.reused_input_tokens),
+                sglang_hicache_route_reused_input_tokens: stats
+                    .sglang_hicache_route_reused_input_tokens,
+                ideal_l1_reused_input_tokens: stats.ideal_l1.map(|bound| bound.reusable_tokens),
+                ideal_l1_recomputed_input_tokens: stats
+                    .ideal_l1
+                    .map(|bound| bound.recomputed_tokens),
+                ideal_l1_zero_queue_ttft_ms: stats.ideal_l1.map(|bound| bound.ttft_ms),
+                ttft_excess_over_ideal_ms: first_token_ms.zip(stats.ideal_l1).map(
+                    |(first_token_ms, bound)| {
+                        (first_token_ms - stats.arrival_time_ms - bound.ttft_ms).max(0.0)
+                    },
+                ),
                 prefill_worker_idx: stats.prefill_worker_idx,
                 decode_worker_idx: stats.decode_worker_idx,
                 prefill_admit_ms: detail.prefill_admit_ms,
@@ -1522,6 +1676,70 @@ fn mean(values: &[f64]) -> f64 {
     } else {
         values.iter().sum::<f64>() / values.len() as f64
     }
+}
+
+fn build_ideal_l1_report(
+    requests: &FxHashMap<Uuid, TraceRequestStats>,
+    realized_hit_rate: f64,
+    realized_ttft: &TraceDistributionStats,
+) -> Option<IdealL1ZeroQueueReport> {
+    let mut input_tokens = 0usize;
+    let mut reusable_tokens = 0usize;
+    let mut recomputed_tokens = 0usize;
+    let mut ideal_ttfts = Vec::new();
+    let mut per_request_excess = Vec::new();
+    let mut requests_below_isolated_bound = 0usize;
+
+    for stats in requests.values() {
+        let Some(ideal) = stats.ideal_l1 else {
+            continue;
+        };
+        input_tokens = input_tokens.saturating_add(stats.input_length);
+        reusable_tokens = reusable_tokens.saturating_add(ideal.reusable_tokens);
+        recomputed_tokens = recomputed_tokens.saturating_add(ideal.recomputed_tokens);
+        if stats.requested_output_length > 0 {
+            ideal_ttfts.push(ideal.ttft_ms);
+        }
+        if stats.terminal_status == Some(ReplayTerminalStatus::Completed)
+            && stats.first_admit_ms.is_some()
+            && let Some(first_token_ms) = stats.first_token_ms()
+        {
+            let actual_ttft_ms = (first_token_ms - stats.arrival_time_ms).max(0.0);
+            if actual_ttft_ms < ideal.ttft_ms {
+                requests_below_isolated_bound += 1;
+            }
+            per_request_excess.push((actual_ttft_ms - ideal.ttft_ms).max(0.0));
+        }
+    }
+
+    if input_tokens == 0 {
+        return None;
+    }
+    let token_hit_rate = reusable_tokens as f64 / input_tokens as f64;
+    let ideal_ttft = build_distribution_stats(ideal_ttfts);
+    Some(IdealL1ZeroQueueReport {
+        history_policy: "unbounded-complete-pages-prebucket-v1".to_string(),
+        timing_policy: "isolated-zero-queue-sglang-prefill-decode-v1".to_string(),
+        queue_time_ms: 0.0,
+        totals: IdealL1Totals {
+            input_tokens,
+            reusable_tokens,
+            recomputed_tokens,
+            token_hit_rate,
+        },
+        distance: DistanceToIdeal {
+            token_hit_rate_gap: (token_hit_rate - realized_hit_rate).max(0.0),
+            p99_ttft_gap_ms: (realized_ttft.p99_ms - ideal_ttft.p99_ms).max(0.0),
+            p99_ttft_over_bound: if ideal_ttft.p99_ms > 0.0 {
+                realized_ttft.p99_ms / ideal_ttft.p99_ms
+            } else {
+                0.0
+            },
+            per_request_ttft_excess: build_distribution_stats(per_request_excess),
+            requests_below_isolated_bound,
+        },
+        ttft: ideal_ttft,
+    })
 }
 
 fn build_distribution_stats(mut values: Vec<f64>) -> TraceDistributionStats {

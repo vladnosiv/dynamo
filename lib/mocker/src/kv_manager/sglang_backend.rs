@@ -9,10 +9,20 @@ use crate::common::kv_cache_trace;
 use crate::common::protocols::KvEventPublishers;
 use dynamo_kv_router::protocols::{
     BlockHashOptions, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheRemoveData,
-    KvCacheStoreData, KvCacheStoredBlockData, LocalBlockHash, compute_block_hash_for_seq,
-    compute_next_seq_hash,
+    KvCacheStoreData, KvCacheStoredBlockData, LocalBlockHash, StorageTier,
+    compute_block_hash_for_seq, compute_next_seq_hash,
 };
 use rustc_hash::FxHashMap;
+use std::collections::BTreeSet;
+
+/// Simulator-private event-id namespace for SWA-checkpoint lifecycle events.
+/// Replay intercepts these ordered events before the generic KV indexer, so
+/// they never contribute ordinary router KV blocks or scores.
+pub(crate) const SGLANG_HICACHE_CHECKPOINT_EVENT_ID_BIT: u64 = 1_u64 << 63;
+
+pub(crate) fn is_sglang_hicache_checkpoint_event(event: &KvCacheEvent) -> bool {
+    event.event_id & SGLANG_HICACHE_CHECKPOINT_EVENT_ID_BIT != 0
+}
 
 /// Move-only ownership of a request's SGLang KV state.
 ///
@@ -118,6 +128,7 @@ pub struct SglangKvManager {
     kv_event_publishers: KvEventPublishers,
     dp_rank: u32,
     next_event_id: u64,
+    next_hicache_checkpoint_event_id: u64,
     /// Maps each dense physical page ID to the block hash assigned during
     /// Stored events, so Removed events can use the same block hash.
     page_to_block_hash: Vec<Option<ExternalSequenceBlockHash>>,
@@ -125,6 +136,23 @@ pub struct SglangKvManager {
     /// block hash so router events reflect logical block visibility, not
     /// transient slot ownership.
     block_hash_refcounts: FxHashMap<ExternalSequenceBlockHash, usize>,
+    /// Enables the rule that a reusable prefix must end at a resident periodic
+    /// SWA checkpoint in addition to retaining the ordinary FULL block chain.
+    checkpoint_tracking: bool,
+    checkpoint_interval_pages: usize,
+    checkpoint_capacity: usize,
+    checkpoint_clock: u64,
+    page_has_checkpoint: Vec<bool>,
+    page_checkpoint_access: Vec<u64>,
+    checkpoint_lru: BTreeSet<(u64, KvPageId)>,
+    checkpoint_pages_by_hash: FxHashMap<ExternalSequenceBlockHash, BTreeSet<KvPageId>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HicacheHydration {
+    pub(crate) reusable_pages: usize,
+    pub(crate) reusable_tokens: usize,
+    pub(crate) loaded_tokens: usize,
 }
 
 pub struct DecodeTokenReservation {
@@ -179,18 +207,68 @@ impl SglangKvManager {
         kv_event_publishers: KvEventPublishers,
         dp_rank: u32,
     ) -> Self {
+        Self::new_internal(total_tokens, page_size, kv_event_publishers, dp_rank, None)
+    }
+
+    pub(crate) fn new_with_hicache(
+        total_tokens: usize,
+        page_size: usize,
+        kv_event_publishers: KvEventPublishers,
+        dp_rank: u32,
+        checkpoint_interval_tokens: usize,
+        checkpoint_capacity: usize,
+    ) -> Self {
+        Self::new_internal(
+            total_tokens,
+            page_size,
+            kv_event_publishers,
+            dp_rank,
+            Some((checkpoint_interval_tokens / page_size, checkpoint_capacity)),
+        )
+    }
+
+    fn new_internal(
+        total_tokens: usize,
+        page_size: usize,
+        kv_event_publishers: KvEventPublishers,
+        dp_rank: u32,
+        checkpoint_config: Option<(usize, usize)>,
+    ) -> Self {
+        let checkpoint_tracking = checkpoint_config.is_some();
         let page_to_block_hash = if kv_event_publishers.is_empty() {
-            Vec::new()
+            if checkpoint_tracking {
+                vec![None; total_tokens / page_size]
+            } else {
+                Vec::new()
+            }
         } else {
             vec![None; total_tokens / page_size]
+        };
+        let page_has_checkpoint = if checkpoint_tracking {
+            vec![false; total_tokens / page_size]
+        } else {
+            Vec::new()
         };
         Self {
             cache: RadixCache::new(total_tokens, page_size),
             kv_event_publishers,
             dp_rank,
             next_event_id: 0,
+            next_hicache_checkpoint_event_id: 0,
             page_to_block_hash,
             block_hash_refcounts: FxHashMap::default(),
+            checkpoint_tracking,
+            checkpoint_interval_pages: checkpoint_config.map_or(0, |config| config.0),
+            checkpoint_capacity: checkpoint_config.map_or(0, |config| config.1),
+            checkpoint_clock: 0,
+            page_has_checkpoint,
+            page_checkpoint_access: if checkpoint_tracking {
+                vec![0; total_tokens / page_size]
+            } else {
+                Vec::new()
+            },
+            checkpoint_lru: BTreeSet::new(),
+            checkpoint_pages_by_hash: FxHashMap::default(),
         }
     }
 
@@ -220,7 +298,10 @@ impl SglangKvManager {
         let page_size = self.cache.page_size();
         lease.ensure_page_hashes(token_ids, page_size);
         let materialized_hashes = lease.page_hashes_through(token_ids.len(), page_size);
-        let (prefix_len, last_node) = self.cache.match_prefix_hashes_and_lock(materialized_hashes);
+        let reusable_pages = self.reusable_device_pages(materialized_hashes);
+        let (prefix_len, last_node) = self
+            .cache
+            .match_prefix_hashes_and_lock(&materialized_hashes[..reusable_pages]);
         let required_pages = token_ids.len().div_ceil(page_size) - prefix_len / page_size;
         let required_tokens = required_pages * page_size;
 
@@ -256,6 +337,158 @@ impl SglangKvManager {
         lease.cached_tokens = prefix_len;
         lease.last_node = Some(last_node);
         Some(prefix_len)
+    }
+
+    /// Lower-tier load used by replay after the router has selected a worker.
+    /// Packed pages are inserted into the ordinary radix cache and the selected
+    /// endpoint receives its periodic SWA checkpoint. The caller charges
+    /// `loaded_tokens` as serialized H2D debt on the next scheduler pass.
+    pub(crate) fn hydrate_prefix_from_hicache(
+        &mut self,
+        token_ids: &[u32],
+        target_pages: usize,
+    ) -> HicacheHydration {
+        if !self.checkpoint_tracking || target_pages == 0 {
+            return HicacheHydration::default();
+        }
+        let page_size = self.cache.page_size();
+        let max_reusable_pages = token_ids.len().saturating_sub(1) / page_size;
+        let page_hashes =
+            compute_block_hash_for_seq(token_ids, page_size as u32, BlockHashOptions::default());
+        let target_pages = target_pages.min(page_hashes.len());
+        if target_pages == 0 {
+            return HicacheHydration::default();
+        }
+
+        let raw_prefix_tokens = self
+            .cache
+            .prefix_match_hashes_len(&page_hashes[..target_pages]);
+        let raw_prefix_pages = raw_prefix_tokens / page_size;
+        let existing_reusable = self.reusable_device_pages(&page_hashes[..target_pages]);
+
+        if raw_prefix_pages < target_pages {
+            let missing_pages = target_pages - raw_prefix_pages;
+            let reservable_pages =
+                (self.cache.available_tokens() + self.cache.evictable_size) / page_size;
+            if missing_pages > reservable_pages {
+                return HicacheHydration {
+                    reusable_pages: existing_reusable,
+                    reusable_tokens: existing_reusable
+                        .min(max_reusable_pages)
+                        .saturating_mul(page_size),
+                    loaded_tokens: 0,
+                };
+            }
+
+            let (locked_prefix, last_node) = self
+                .cache
+                .match_prefix_hashes_and_lock(&page_hashes[..target_pages]);
+            debug_assert_eq!(locked_prefix, raw_prefix_tokens);
+            let required_tokens = missing_pages * page_size;
+            if required_tokens > self.cache.available_tokens() {
+                self.evict(required_tokens - self.cache.available_tokens());
+            }
+            let mut pages = self.collect_path_pages_through(last_node, raw_prefix_tokens);
+            let Some(mut loaded_pages) = self.cache.page_pool.allocate_pages(missing_pages) else {
+                self.cache.dec_lock_ref(last_node);
+                return HicacheHydration {
+                    reusable_pages: existing_reusable,
+                    reusable_tokens: existing_reusable
+                        .min(max_reusable_pages)
+                        .saturating_mul(page_size),
+                    loaded_tokens: 0,
+                };
+            };
+            pages.append(&mut loaded_pages);
+            self.cache.insert_page_hashes_from_node(
+                last_node,
+                raw_prefix_tokens,
+                &page_hashes[..target_pages],
+                &pages,
+            );
+            self.cache.dec_lock_ref(last_node);
+            self.publish_stored_hashes(
+                &page_hashes[..target_pages],
+                &pages,
+                target_pages * page_size,
+                raw_prefix_tokens,
+            );
+        } else {
+            let (_, last_node) = self
+                .cache
+                .match_prefix_hashes_and_lock(&page_hashes[..target_pages]);
+            let pages = self.collect_path_pages_through(last_node, target_pages * page_size);
+            self.mark_checkpoint_page(pages[target_pages - 1]);
+            self.cache.dec_lock_ref(last_node);
+        }
+
+        let reusable_pages = self.reusable_device_pages(&page_hashes[..target_pages]);
+        HicacheHydration {
+            reusable_pages,
+            reusable_tokens: reusable_pages
+                .min(max_reusable_pages)
+                .saturating_mul(page_size),
+            loaded_tokens: target_pages
+                .saturating_sub(raw_prefix_pages)
+                .saturating_mul(page_size),
+        }
+    }
+
+    /// Return the complete-block prefix reusable by a newly admitted
+    /// request. SGLang resolves this boundary once before chunked prefill; it
+    /// does not walk an already-cached long prompt one chunk at a time.
+    pub(crate) fn hicache_reusable_prefix_tokens(&mut self, token_ids: &[u32]) -> usize {
+        if !self.checkpoint_tracking {
+            return 0;
+        }
+        let page_size = self.cache.page_size();
+        let max_reusable_pages = token_ids.len().saturating_sub(1) / page_size;
+        if max_reusable_pages == 0 {
+            return 0;
+        }
+        let page_hashes =
+            compute_block_hash_for_seq(token_ids, page_size as u32, BlockHashOptions::default());
+        self.reusable_device_pages(&page_hashes)
+            .min(max_reusable_pages)
+            .saturating_mul(page_size)
+    }
+
+    /// Lock a previously probed HiCache prefix into the request lease without
+    /// allocating or recomputing it. The replay is single-threaded, so the
+    /// immutable probe and this lock are adjacent cache operations.
+    pub(crate) fn prime_hicache_reusable_prefix(
+        &mut self,
+        token_ids: &[u32],
+        reusable_tokens: usize,
+        lease: &mut RadixRequestLease,
+    ) -> bool {
+        if reusable_tokens == 0 {
+            return true;
+        }
+        assert!(
+            self.checkpoint_tracking,
+            "HiCache prefix priming requires SWA checkpoint tracking"
+        );
+        assert!(!lease.is_active(), "request KV lease is already active");
+        let page_size = self.cache.page_size();
+        assert_eq!(
+            reusable_tokens % page_size,
+            0,
+            "HiCache reusable prefix must be page-aligned"
+        );
+        lease.ensure_page_hashes(token_ids, page_size);
+        let page_hashes = lease.page_hashes_through(reusable_tokens, page_size);
+        let (matched_tokens, last_node) = self.cache.match_prefix_hashes_and_lock(page_hashes);
+        if matched_tokens != reusable_tokens {
+            self.cache.dec_lock_ref(last_node);
+            return false;
+        }
+        let pages = self.collect_path_pages_through(last_node, matched_tokens);
+        lease.pages = pages;
+        lease.materialized_tokens = matched_tokens;
+        lease.cached_tokens = matched_tokens;
+        lease.last_node = Some(last_node);
+        true
     }
 
     #[cfg(test)]
@@ -794,6 +1027,193 @@ impl SglangKvManager {
         });
     }
 
+    fn sequence_hashes(page_hashes: &[LocalBlockHash]) -> Vec<ExternalSequenceBlockHash> {
+        let mut parent = None;
+        page_hashes
+            .iter()
+            .copied()
+            .map(|tokens_hash| {
+                let hash = match parent {
+                    Some(parent_hash) => {
+                        ExternalSequenceBlockHash(compute_next_seq_hash(parent_hash, tokens_hash))
+                    }
+                    None => ExternalSequenceBlockHash(tokens_hash.0),
+                };
+                parent = Some(hash.0);
+                hash
+            })
+            .collect()
+    }
+
+    fn reusable_device_pages(&mut self, page_hashes: &[LocalBlockHash]) -> usize {
+        let raw_pages = self.cache.prefix_match_hashes_len(page_hashes) / self.cache.page_size();
+        if !self.checkpoint_tracking {
+            return raw_pages;
+        }
+        let sequence_hashes = Self::sequence_hashes(&page_hashes[..raw_pages]);
+        let reusable = sequence_hashes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hash)| {
+                self.checkpoint_pages_by_hash
+                    .contains_key(hash)
+                    .then_some(index + 1)
+            })
+            .last()
+            .unwrap_or(0);
+        if reusable > 0 {
+            self.touch_checkpoint_hash(sequence_hashes[reusable - 1]);
+        }
+        reusable
+    }
+
+    fn mark_checkpoint_page(&mut self, page: KvPageId) {
+        if !self.checkpoint_tracking {
+            return;
+        }
+        let page_slot = page.index();
+        if self.page_has_checkpoint[page_slot] {
+            self.touch_checkpoint_page(page);
+            return;
+        }
+        let Some(block_hash) = self.page_to_block_hash[page_slot] else {
+            return;
+        };
+        while self.checkpoint_lru.len() >= self.checkpoint_capacity {
+            let Some((_, victim)) = self.checkpoint_lru.pop_first() else {
+                break;
+            };
+            self.clear_checkpoint_page(victim, true);
+        }
+        if self.checkpoint_lru.len() >= self.checkpoint_capacity {
+            return;
+        }
+        self.page_has_checkpoint[page_slot] = true;
+        let first_for_hash = !self.checkpoint_pages_by_hash.contains_key(&block_hash);
+        self.checkpoint_pages_by_hash
+            .entry(block_hash)
+            .or_default()
+            .insert(page);
+        self.touch_checkpoint_page(page);
+        if first_for_hash {
+            self.publish_hicache_checkpoint_stored(block_hash);
+        }
+    }
+
+    fn mark_checkpoint_pages(&mut self, pages: &[KvPageId], first_page_index: usize) {
+        if !self.checkpoint_tracking {
+            return;
+        }
+        for (offset, &page) in pages.iter().enumerate() {
+            if (first_page_index + offset + 1) % self.checkpoint_interval_pages == 0 {
+                self.mark_checkpoint_page(page);
+            }
+        }
+    }
+
+    fn touch_checkpoint_hash(&mut self, hash: ExternalSequenceBlockHash) {
+        let page = self
+            .checkpoint_pages_by_hash
+            .get(&hash)
+            .and_then(|pages| pages.first().copied());
+        if let Some(page) = page {
+            self.touch_checkpoint_page(page);
+        }
+    }
+
+    fn touch_checkpoint_page(&mut self, page: KvPageId) {
+        let page_slot = page.index();
+        if !self.page_has_checkpoint[page_slot] {
+            return;
+        }
+        self.checkpoint_lru
+            .remove(&(self.page_checkpoint_access[page_slot], page));
+        self.checkpoint_clock = self.checkpoint_clock.saturating_add(1);
+        self.page_checkpoint_access[page_slot] = self.checkpoint_clock;
+        self.checkpoint_lru.insert((self.checkpoint_clock, page));
+    }
+
+    fn clear_checkpoint_page(&mut self, page: KvPageId, publish_event: bool) {
+        let page_slot = page.index();
+        if !self.page_has_checkpoint[page_slot] {
+            return;
+        }
+        self.checkpoint_lru
+            .remove(&(self.page_checkpoint_access[page_slot], page));
+        self.page_has_checkpoint[page_slot] = false;
+        self.page_checkpoint_access[page_slot] = 0;
+        let Some(block_hash) = self.page_to_block_hash[page_slot] else {
+            return;
+        };
+        let mut last_for_hash = false;
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.checkpoint_pages_by_hash.entry(block_hash)
+        {
+            entry.get_mut().remove(&page);
+            if entry.get().is_empty() {
+                entry.remove();
+                last_for_hash = true;
+            }
+        }
+        if publish_event && last_for_hash {
+            self.publish_hicache_checkpoint_removed(block_hash);
+        }
+    }
+
+    fn next_hicache_checkpoint_event_id(&mut self) -> u64 {
+        let event_id =
+            SGLANG_HICACHE_CHECKPOINT_EVENT_ID_BIT | self.next_hicache_checkpoint_event_id;
+        self.next_hicache_checkpoint_event_id = self
+            .next_hicache_checkpoint_event_id
+            .checked_add(1)
+            .expect("SGLang HiCache checkpoint event ID overflow");
+        event_id
+    }
+
+    fn publish_hicache_checkpoint_stored(&mut self, block_hash: ExternalSequenceBlockHash) {
+        if self.kv_event_publishers.is_empty() {
+            return;
+        }
+        let event = KvCacheEvent {
+            event_id: self.next_hicache_checkpoint_event_id(),
+            data: KvCacheEventData::Stored(KvCacheStoreData {
+                parent_hash: None,
+                start_position: None,
+                blocks: vec![KvCacheStoredBlockData {
+                    block_hash,
+                    tokens_hash: LocalBlockHash(0),
+                    mm_extra_info: None,
+                }],
+            }),
+            dp_rank: self.dp_rank,
+        };
+        if let Err(error) =
+            self.kv_event_publishers
+                .publish_with_storage_tier(event, None, StorageTier::HostPinned)
+        {
+            tracing::warn!(%error, "failed to publish SGLang HiCache checkpoint-store event");
+        }
+    }
+
+    fn publish_hicache_checkpoint_removed(&mut self, block_hash: ExternalSequenceBlockHash) {
+        if self.kv_event_publishers.is_empty() {
+            return;
+        }
+        let event = KvCacheEvent {
+            event_id: self.next_hicache_checkpoint_event_id(),
+            data: KvCacheEventData::Removed(KvCacheRemoveData {
+                block_hashes: vec![block_hash],
+            }),
+            dp_rank: self.dp_rank,
+        };
+        if let Err(error) =
+            self.kv_event_publishers
+                .publish_with_storage_tier(event, None, StorageTier::HostPinned)
+        {
+            tracing::warn!(%error, "failed to publish SGLang HiCache checkpoint-remove event");
+        }
+    }
+
     fn publish_stored_hashes(
         &mut self,
         page_hashes: &[LocalBlockHash],
@@ -801,7 +1221,7 @@ impl SglangKvManager {
         num_tokens: usize,
         first_new_token: usize,
     ) -> usize {
-        if self.kv_event_publishers.is_empty() {
+        if self.kv_event_publishers.is_empty() && !self.checkpoint_tracking {
             return 0;
         }
         if self.page_to_block_hash.is_empty() {
@@ -826,6 +1246,7 @@ impl SglangKvManager {
         let Some(first_unpublished_page) = (first_page..complete_pages)
             .find(|&page_idx| self.page_to_block_hash[pages[page_idx].index()].is_none())
         else {
+            self.mark_checkpoint_pages(&pages[first_page..complete_pages], first_page);
             return 0;
         };
 
@@ -872,6 +1293,7 @@ impl SglangKvManager {
 
         let hashed_blocks = local_hashes.len();
         if blocks.is_empty() {
+            self.mark_checkpoint_pages(&pages[first_page..complete_pages], first_page);
             return hashed_blocks;
         }
 
@@ -889,18 +1311,25 @@ impl SglangKvManager {
         if let Err(e) = self.kv_event_publishers.publish(event, None) {
             tracing::warn!("Failed to publish SGLang KV event: {e}");
         }
+        self.mark_checkpoint_pages(&pages[first_page..complete_pages], first_page);
 
         hashed_blocks
     }
 
     fn publish_removed_pages(&mut self, evicted_pages: &[KvPageId]) {
-        if self.kv_event_publishers.is_empty() {
+        if self.kv_event_publishers.is_empty() && !self.checkpoint_tracking {
             return;
         }
 
         let mut block_hashes = Vec::new();
         for (page_idx, &page) in evicted_pages.iter().enumerate() {
-            let Some(block_hash) = self.page_to_block_hash[page.index()].take() else {
+            let page_slot = page.index();
+            if self.checkpoint_tracking && self.page_has_checkpoint[page_slot] {
+                // Preserve the mirror's checkpoint bit until the following
+                // Device Removed event so write-back captures the full bundle.
+                self.clear_checkpoint_page(page, false);
+            }
+            let Some(block_hash) = self.page_to_block_hash[page_slot].take() else {
                 continue;
             };
             if let std::collections::hash_map::Entry::Occupied(mut entry) =
@@ -918,7 +1347,7 @@ impl SglangKvManager {
             }
         }
 
-        if block_hashes.is_empty() {
+        if block_hashes.is_empty() || self.kv_event_publishers.is_empty() {
             return;
         }
 
@@ -1427,6 +1856,36 @@ mod tests {
         assert_eq!(first.blocks.len(), 1);
         assert_eq!(second.blocks.len(), 1);
         assert_eq!(second.parent_hash, Some(first.blocks[0].block_hash));
+    }
+
+    #[test]
+    fn hicache_marks_swa_checkpoints_at_the_configured_interval() {
+        let mut mgr =
+            SglangKvManager::new_with_hicache(20, 4, KvEventPublishers::default(), 0, 8, 16);
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let mut alloc = mgr.allocate_for_request(&tokens[..3]).unwrap();
+
+        assert!(mgr.extend_allocation(&tokens[..10], &mut alloc.lease));
+        let pages = alloc.lease.pages();
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| mgr.page_has_checkpoint[page.index()])
+                .collect::<Vec<_>>(),
+            vec![false, true, false],
+            "only the second complete block crosses the eight-token checkpoint interval"
+        );
+
+        assert!(mgr.extend_allocation(&tokens, &mut alloc.lease));
+        assert_eq!(
+            alloc
+                .lease
+                .pages()
+                .iter()
+                .map(|page| mgr.page_has_checkpoint[page.index()])
+                .collect::<Vec<_>>(),
+            vec![false, true, false, true]
+        );
     }
 
     #[test]

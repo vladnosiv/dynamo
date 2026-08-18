@@ -19,6 +19,7 @@ use super::evidence::{
 };
 #[cfg(test)]
 use super::extensions::kv_router::AggRuntime;
+use super::ideal_l1::IdealL1ZeroQueueTracker;
 use super::progress::ReplayProgress;
 use super::runtime_utils::{
     ReadyWorkerCompletions, next_timestamp as choose_next_timestamp, pop_ready_scaling_tick,
@@ -39,7 +40,9 @@ use super::{
     },
     state::AggRequestState,
 };
-use crate::common::protocols::{DirectRequest, ForwardPassSnapshot, MockEngineArgs, OutputSignal};
+use crate::common::protocols::{
+    DirectRequest, EngineType, ForwardPassSnapshot, MockEngineArgs, OutputSignal,
+};
 use crate::loadgen::{ReplayRequestPayload, WorkloadDriver};
 #[cfg(test)]
 use crate::replay::ReplayRouterMode;
@@ -129,6 +132,7 @@ where
     requests: FxHashMap<Uuid, AggRequestState>,
     engine: EngineComponent<Observation>,
     collector: TraceCollector,
+    ideal_l1: Option<IdealL1ZeroQueueTracker>,
     events: BinaryHeap<SimulationEvent<Observation::Batch>>,
     placement: PlacementPolicyImpl,
     progress: ReplayProgress,
@@ -211,6 +215,8 @@ where
         );
         engine.set_scaling_args(args.clone(), Observation::CAPTURE_RAW);
         let placement = create_placement(&args, engine.active_topology())?;
+        let ideal_l1 = (args.engine_type == EngineType::Sglang)
+            .then(|| IdealL1ZeroQueueTracker::from_args(&args));
 
         // Aggregated replay has a single (decode) pool; record its GPUs/worker
         // so the report can express GPU-hours from the mocker's own parallelism.
@@ -226,6 +232,7 @@ where
             requests: FxHashMap::default(),
             engine,
             collector,
+            ideal_l1,
             events: BinaryHeap::new(),
             placement,
             progress,
@@ -355,7 +362,19 @@ where
         request: DirectRequest,
         uuid: Uuid,
         worker_idx: usize,
+        hicache_target_pages: usize,
     ) -> anyhow::Result<()> {
+        if hicache_target_pages > 0 {
+            let hydration = self.engine.hydrate_sglang_prefix(
+                worker_idx,
+                &request.tokens,
+                hicache_target_pages,
+            )?;
+            self.collector
+                .add_sglang_hicache_h2d_tokens(hydration.loaded_tokens);
+            self.collector
+                .on_sglang_hicache_route_reuse(uuid, hydration.reusable_tokens);
+        }
         self.engine.dispatch(worker_idx, request)?;
         self.record_dispatch(uuid, worker_idx);
         // Aggregated replay uses a single pool. Treat the assignment as the
@@ -407,7 +426,12 @@ where
                     anyhow::anyhow!("offline replay missing queued request state for {uuid}")
                 })?
                 .take_queued_request(uuid)?;
-            self.dispatch_to_worker(request, uuid, placement.scheduler_id)?;
+            self.dispatch_to_worker(
+                request,
+                uuid,
+                placement.scheduler_id,
+                placement.hicache_target_pages,
+            )?;
         }
         Ok(())
     }
@@ -430,6 +454,15 @@ where
 
         self.collector
             .on_arrival(uuid, arrival_time_ms, input_length, output_length);
+        if let Some(ideal_l1) = self.ideal_l1.as_mut() {
+            let bound = ideal_l1.observe(
+                &request,
+                metadata.replay_hashes(),
+                arrival_time_ms,
+                output_length,
+            )?;
+            self.collector.on_ideal_l1_bound(uuid, bound);
+        }
         self.traffic.on_arrival();
 
         let effects = self
@@ -469,6 +502,7 @@ where
                     request.into_direct_request(),
                     uuid,
                     placement.scheduler_id,
+                    placement.hicache_target_pages,
                 )?;
             }
             PlacementDecision::Queued => {
@@ -542,6 +576,10 @@ where
     ) -> anyhow::Result<()> {
         Observation::record_ingestion(&events, WorkerPool::Agg, boundary, self.now_ms)?;
         let placements = self.placement.observe(events, self.now_ms)?;
+        for debt in self.placement.drain_host_io_debts() {
+            self.engine
+                .record_sglang_hicache_io_tokens(debt.scheduler_id, debt.tokens)?;
+        }
         self.dispatch_placements(placements)
     }
 
@@ -1246,8 +1284,10 @@ where
 
     /// Finalize the replay and return the simulation report directly.
     #[cfg(test)]
-    fn finalize_report(self) -> crate::replay::TraceSimulationReport {
+    fn finalize_report(mut self) -> crate::replay::TraceSimulationReport {
         self.progress.finish();
+        self.collector
+            .set_sglang_hicache_report(self.placement.sglang_hicache_report());
         self.collector.finish()
     }
 
@@ -1283,6 +1323,8 @@ where
         }
 
         self.progress.finish();
+        self.collector
+            .set_sglang_hicache_report(self.placement.sglang_hicache_report());
         Ok((self.collector, self.stats))
     }
 
@@ -1355,7 +1397,10 @@ mod tests {
         run_trace_workload_multi_collect_with_stats, run_trace_workload_single_collect,
     };
     use super::*;
-    use crate::common::protocols::{EngineType, G1Backend, SglangArgs};
+    use crate::common::protocols::{
+        EngineType, G1Backend, SglangArgs, SglangHiCacheArgs, SglangHiCacheSwaCheckpoint,
+        SglangHiCacheWritePolicy,
+    };
     use crate::loadgen::{AgenticTrace, AgenticTurnTrace, SessionTrace, Trace, TurnTrace};
     use crate::replay::offline::extensions::kv_router::{ReplayKvRouterConfig, RouterQueuePolicy};
     use crate::replay::{TraceRequestStatsSnapshot, normalize_trace_requests};
@@ -1459,6 +1504,38 @@ mod tests {
             .enable_prefix_caching(enable_prefix_caching)
             .enable_chunked_prefill(enable_chunked_prefill)
             .speedup_ratio(0.0)
+            .build()
+            .unwrap()
+    }
+
+    fn sglang_hicache_args(write_policy: SglangHiCacheWritePolicy) -> MockEngineArgs {
+        MockEngineArgs::builder()
+            .engine_type(EngineType::Sglang)
+            .block_size(256)
+            .kv_bytes_per_token(Some(1))
+            .num_gpu_blocks(64)
+            .max_num_batched_tokens(Some(8192))
+            .max_num_seqs(Some(4))
+            .enable_prefix_caching(true)
+            .enable_chunked_prefill(true)
+            .speedup_ratio(1000.0)
+            .sglang(Some(SglangArgs {
+                page_size: Some(256),
+                chunked_prefill_size: Some(512),
+                hicache: Some(SglangHiCacheArgs {
+                    write_policy,
+                    l2_capacity_blocks: 16,
+                    l1_checkpoint_capacity: 2,
+                    l2_checkpoint_capacity: 4,
+                    swa_checkpoint: SglangHiCacheSwaCheckpoint {
+                        interval_tokens: 256,
+                        bytes: 1,
+                    },
+                    l3_capacity_gib: 1,
+                    io_tokens_per_second: 160_000,
+                }),
+                ..Default::default()
+            }))
             .build()
             .unwrap()
     }
@@ -2903,6 +2980,60 @@ mod tests {
             vec![0, 32],
             "second identical SGLang request should see all 32 KV blocks cached"
         );
+    }
+
+    #[test]
+    fn sglang_hicache_report_and_ideal_bound_follow_the_replay_contract() {
+        let args = sglang_hicache_args(SglangHiCacheWritePolicy::WriteThrough);
+        let tokens = (0..1024).collect::<Vec<u32>>();
+        let (collector, _) = run_trace_multi_collect_with_stats(
+            &args,
+            vec![
+                DirectRequest {
+                    tokens: tokens.clone(),
+                    max_output_tokens: 1,
+                    uuid: Some(Uuid::from_u128(921)),
+                    arrival_timestamp_ms: Some(0.0),
+                    ..Default::default()
+                },
+                DirectRequest {
+                    tokens,
+                    max_output_tokens: 1,
+                    uuid: Some(Uuid::from_u128(922)),
+                    arrival_timestamp_ms: Some(500.0),
+                    ..Default::default()
+                },
+            ],
+            2,
+            ReplayRouterMode::KvRouter,
+        );
+
+        let report = collector.finish();
+        let hicache = report.sglang_hicache.expect("HiCache report");
+        assert_eq!(hicache.block_size_tokens, 256);
+        assert_eq!(hicache.full_bytes_per_block, 256);
+        assert_eq!(hicache.swa_checkpoint_bytes, 1);
+        assert!(hicache.d2h_tokens > 0);
+        assert!(hicache.l3.used_bytes > 0);
+        assert_eq!(
+            hicache.total_host_io_tokens,
+            hicache.d2h_tokens + hicache.h2d_tokens
+        );
+        assert_eq!(hicache.route_input_tokens, 2048);
+        assert_eq!(hicache.route_reused_tokens, 768);
+        assert_eq!(hicache.route_recomputed_tokens, 1280);
+        assert!((hicache.route_token_hit_rate - 0.375).abs() < 1e-12);
+        assert_eq!(hicache.admission_input_tokens, 2048);
+        assert_eq!(hicache.admission_reused_tokens, 768);
+        assert_eq!(hicache.admission_recomputed_tokens, 1280);
+        assert!((hicache.admission_token_hit_rate - 0.375).abs() < 1e-12);
+
+        let ideal = report.ideal_l1_zero_queue.expect("ideal L1 report");
+        assert_eq!(ideal.totals.input_tokens, 2048);
+        assert_eq!(ideal.totals.reusable_tokens, 768);
+        assert_eq!(ideal.totals.recomputed_tokens, 1280);
+        assert!((ideal.totals.token_hit_rate - 0.375).abs() < 1e-12);
+        assert!(ideal.distance.token_hit_rate_gap.abs() < 1e-12);
     }
 
     #[test]

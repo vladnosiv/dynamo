@@ -16,6 +16,7 @@ pub(in crate::replay) trait ReplayAdmissionMetadata: Sized {
     fn from_hashes(hashes: Option<ReplayRequestHashes>) -> Self;
     fn for_prefill(self) -> Self;
     fn max_output_tokens_override(&self) -> Option<usize>;
+    fn replay_hashes(&self) -> Option<&ReplayRequestHashes>;
     fn into_hashes(self) -> Option<ReplayRequestHashes>;
 }
 
@@ -30,6 +31,11 @@ impl ReplayAdmissionMetadata for () {
 
     #[inline]
     fn max_output_tokens_override(&self) -> Option<usize> {
+        None
+    }
+
+    #[inline]
+    fn replay_hashes(&self) -> Option<&ReplayRequestHashes> {
         None
     }
 
@@ -63,6 +69,11 @@ impl ReplayAdmissionMetadata for KvReplayMetadata {
     #[inline]
     fn max_output_tokens_override(&self) -> Option<usize> {
         self.max_output_tokens_override
+    }
+
+    #[inline]
+    fn replay_hashes(&self) -> Option<&ReplayRequestHashes> {
+        self.hashes.as_ref()
     }
 
     #[inline]

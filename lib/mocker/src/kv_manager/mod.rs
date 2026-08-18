@@ -57,6 +57,7 @@ pub struct OffloadDependency {
 mod g1_manager;
 pub mod kvbm_backend;
 pub mod sglang_backend;
+pub(crate) mod sglang_hicache;
 mod vllm_backend;
 #[cfg(test)]
 mod vllm_firewall_tests;
@@ -65,4 +66,5 @@ pub(crate) use g1_manager::DestinationReservation;
 pub use g1_manager::G1Manager;
 pub use kvbm_backend::KvManager;
 pub use sglang_backend::SglangKvManager;
+pub use sglang_hicache::{SglangHiCacheReport, SglangL3Report};
 pub(crate) use vllm_backend::BlockRequestLease;

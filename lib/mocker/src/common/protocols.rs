@@ -535,6 +535,66 @@ impl ReasoningConfig {
     }
 }
 
+/// SGLang HiCache write policy modeled by DynoSim.
+///
+/// These are the two policies supported by upstream SGLang. Experimental
+/// policies intentionally stay out of the mocker contract until their runtime
+/// semantics exist outside the simulator.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SglangHiCacheWritePolicy {
+    WriteBack,
+    #[default]
+    WriteThrough,
+}
+
+/// Periodic SWA state required to reuse a prefix ending at a checkpoint.
+///
+/// The regular KV representation remains the mocker's existing FULL block,
+/// sized by `kv_bytes_per_token * block_size`. This sidecar describes only
+/// the extra state that cannot be represented by that homogeneous block.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct SglangHiCacheSwaCheckpoint {
+    /// Distance between reusable SWA boundaries. Must be a multiple of the
+    /// engine block size.
+    #[validate(range(min = 1))]
+    pub interval_tokens: usize,
+    /// Physical bytes stored at each checkpoint boundary.
+    #[validate(range(min = 1))]
+    pub bytes: u64,
+}
+
+/// SGLang HiCache configuration for replay.
+///
+/// FULL blocks use the engine's ordinary `block_size`, `num_gpu_blocks`, and
+/// `kv_bytes_per_token` settings. Shared L3 capacity is configured in GiB but
+/// enforced internally in bytes. Host IO is charged as an effective serialized
+/// token rate; this represents measured PCIe transfer plus scheduler stalls
+/// rather than raw link bandwidth.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct SglangHiCacheArgs {
+    #[serde(default)]
+    pub write_policy: SglangHiCacheWritePolicy,
+    /// Worker-local host capacity for ordinary FULL blocks.
+    #[validate(range(min = 1))]
+    pub l2_capacity_blocks: usize,
+    /// Number of checkpoint sidecars independently resident in device memory.
+    #[validate(range(min = 1))]
+    pub l1_checkpoint_capacity: usize,
+    /// Number of checkpoint sidecars independently resident in host memory.
+    #[validate(range(min = 1))]
+    pub l2_checkpoint_capacity: usize,
+    /// Model-independent SWA checkpoint geometry.
+    #[validate(nested)]
+    pub swa_checkpoint: SglangHiCacheSwaCheckpoint,
+    /// Shared Mooncake-like L3 capacity. One GiB is exactly 2^30 bytes; zero
+    /// keeps worker-local L2 enabled while disabling shared L3 admission.
+    pub l3_capacity_gib: u64,
+    /// Effective serialized L1<->L2 rate in logical tokens per second.
+    #[validate(range(min = 1))]
+    pub io_tokens_per_second: u64,
+}
+
 /// SGLang-specific configuration parameters.
 ///
 /// Grouped into a nested struct to keep the `MockEngineArgs` namespace clean,
@@ -558,6 +618,9 @@ pub struct SglangArgs {
     /// Schedule conservativeness factor (0.0–1.0). Default: 1.0.
     #[validate(range(min = 0.0, max = 1.0))]
     pub schedule_conservativeness: Option<f64>,
+    /// Optional hierarchical cache simulation for offline replay.
+    #[validate(nested)]
+    pub hicache: Option<SglangHiCacheArgs>,
 }
 
 /// TensorRT-LLM-specific configuration parameters.
@@ -1052,6 +1115,56 @@ fn validate_mock_engine_args(args: &MockEngineArgs) -> Result<(), ValidationErro
             "g1_backend=native cannot be combined with KVBM G2/G3/G4 offload; omit g1_backend to select KVBM automatically or set g1_backend=kvbm explicitly"
                 .to_string(),
         ));
+    }
+
+    if let Some(hicache) = args
+        .sglang
+        .as_ref()
+        .and_then(|sglang| sglang.hicache.as_ref())
+    {
+        if args.engine_type != EngineType::Sglang {
+            return Err(mock_engine_args_validation_error(
+                "sglang_hicache_requires_sglang",
+                format!(
+                    "sglang.hicache requires engine_type=sglang, got engine_type={:?}",
+                    args.engine_type
+                ),
+            ));
+        }
+        let Some(kv_bytes_per_token) = args.kv_bytes_per_token.filter(|bytes| *bytes > 0) else {
+            return Err(mock_engine_args_validation_error(
+                "sglang_hicache_requires_kv_bytes_per_token",
+                "sglang.hicache requires a positive kv_bytes_per_token to size FULL blocks"
+                    .to_string(),
+            ));
+        };
+        if kv_bytes_per_token.checked_mul(args.block_size).is_none() {
+            return Err(mock_engine_args_validation_error(
+                "sglang_hicache_full_block_bytes_overflow",
+                format!(
+                    "kv_bytes_per_token={} * block_size={} overflows FULL block bytes",
+                    kv_bytes_per_token, args.block_size
+                ),
+            ));
+        }
+        if hicache.swa_checkpoint.interval_tokens % args.block_size != 0 {
+            return Err(mock_engine_args_validation_error(
+                "sglang_hicache_swa_checkpoint_alignment",
+                format!(
+                    "sglang.hicache.swa_checkpoint.interval_tokens={} must be a multiple of block_size={}",
+                    hicache.swa_checkpoint.interval_tokens, args.block_size
+                ),
+            ));
+        }
+        if hicache.l3_capacity_gib.checked_mul(1_u64 << 30).is_none() {
+            return Err(mock_engine_args_validation_error(
+                "sglang_hicache_l3_capacity_overflow",
+                format!(
+                    "sglang.hicache l3_capacity_gib={} overflows byte capacity",
+                    hicache.l3_capacity_gib
+                ),
+            ));
+        }
     }
 
     if args.num_g3_blocks.is_some() && args.num_g2_blocks.is_none() {
@@ -1901,6 +2014,67 @@ mod tests {
                 .to_string()
                 .contains("block_size and sglang.page_size to match"),
             "unexpected error: {error}",
+        );
+    }
+
+    fn hicache_sglang_args(
+        block_size: usize,
+        checkpoint_interval_tokens: usize,
+        kv_bytes_per_token: Option<usize>,
+    ) -> MockEngineArgs {
+        MockEngineArgs::builder()
+            .engine_type(EngineType::Sglang)
+            .block_size(block_size)
+            .kv_bytes_per_token(kv_bytes_per_token)
+            .sglang(Some(SglangArgs {
+                page_size: Some(block_size),
+                hicache: Some(SglangHiCacheArgs {
+                    write_policy: SglangHiCacheWritePolicy::WriteBack,
+                    l2_capacity_blocks: 8,
+                    l1_checkpoint_capacity: 2,
+                    l2_checkpoint_capacity: 4,
+                    swa_checkpoint: SglangHiCacheSwaCheckpoint {
+                        interval_tokens: checkpoint_interval_tokens,
+                        bytes: 1024,
+                    },
+                    l3_capacity_gib: 1,
+                    io_tokens_per_second: 160_000,
+                }),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_sglang_hicache_accepts_generic_full_blocks_and_aligned_checkpoints() {
+        let args = hicache_sglang_args(16, 32, Some(64)).normalized().unwrap();
+        let hicache = args.sglang.unwrap().hicache.unwrap();
+        assert_eq!(args.block_size, 16);
+        assert_eq!(hicache.swa_checkpoint.interval_tokens, 32);
+    }
+
+    #[test]
+    fn test_sglang_hicache_rejects_unaligned_checkpoint_interval() {
+        let error = hicache_sglang_args(16, 24, Some(64))
+            .normalized()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must be a multiple of block_size"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_sglang_hicache_requires_full_block_byte_size() {
+        let error = hicache_sglang_args(16, 32, None).normalized().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a positive kv_bytes_per_token"),
+            "unexpected error: {error}"
         );
     }
 

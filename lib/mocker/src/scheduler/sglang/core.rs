@@ -49,6 +49,8 @@ pub(crate) struct SglangCore {
     destination_holds: DestinationHolds<ReservedSglangDecode>,
     active_destination_handoffs: ActiveHandoffRequests,
     capacity_generation: u64,
+    hicache_io_tokens_per_second: Option<u64>,
+    hicache_pending_io_tokens: u64,
     #[cfg(test)]
     destination_reservation_attempts: usize,
     lifecycle_events: Vec<SchedulerLifecycleEvent>,
@@ -130,6 +132,26 @@ impl SglangCore {
             SpeculativeDecodeSampler::new(rates, args.aic_mtp_seed.wrapping_add(seed_offset))
         });
 
+        let hicache_config = args
+            .sglang
+            .as_ref()
+            .and_then(|sglang| sglang.hicache.as_ref());
+        let hicache_io_tokens_per_second =
+            hicache_config.map(|hicache| hicache.io_tokens_per_second);
+
+        let kv_manager = if let Some(hicache) = hicache_config {
+            SglangKvManager::new_with_hicache(
+                total_tokens,
+                args.block_size,
+                kv_event_publishers,
+                dp_rank,
+                hicache.swa_checkpoint.interval_tokens,
+                hicache.l1_checkpoint_capacity,
+            )
+        } else {
+            SglangKvManager::new(total_tokens, args.block_size, kv_event_publishers, dp_rank)
+        };
+
         Self {
             config,
             dp_rank,
@@ -137,12 +159,7 @@ impl SglangCore {
             prebuilt_ready: VecDeque::new(),
             running: Vec::new(),
             new_token_ratio: SglangConfig::from_args(&args).init_new_token_ratio,
-            kv_manager: SglangKvManager::new(
-                total_tokens,
-                args.block_size,
-                kv_event_publishers,
-                dp_rank,
-            ),
+            kv_manager,
             speculative_sampler,
             kv_event_buffer,
             source_holds: SourceHolds::default(),
@@ -150,6 +167,8 @@ impl SglangCore {
             destination_holds: DestinationHolds::default(),
             active_destination_handoffs: ActiveHandoffRequests::default(),
             capacity_generation: 0,
+            hicache_io_tokens_per_second,
+            hicache_pending_io_tokens: 0,
             #[cfg(test)]
             destination_reservation_attempts: 0,
             lifecycle_events: Vec::new(),
@@ -164,6 +183,33 @@ impl SglangCore {
             SchedulerCommandResult::Submitted(uuid) => uuid,
             _ => unreachable!("submit command must return a request ID"),
         }
+    }
+
+    pub(crate) fn hydrate_prefix_from_hicache(
+        &mut self,
+        token_ids: &[u32],
+        target_pages: usize,
+    ) -> crate::kv_manager::sglang_backend::HicacheHydration {
+        let hydration = self
+            .kv_manager
+            .hydrate_prefix_from_hicache(token_ids, target_pages);
+        self.record_hicache_io_tokens(hydration.loaded_tokens);
+        hydration
+    }
+
+    pub(crate) fn record_hicache_io_tokens(&mut self, tokens: usize) {
+        self.hicache_pending_io_tokens = self
+            .hicache_pending_io_tokens
+            .saturating_add(u64::try_from(tokens).unwrap_or(u64::MAX));
+    }
+
+    fn charge_hicache_io_ms(&mut self) -> f64 {
+        let Some(rate) = self.hicache_io_tokens_per_second else {
+            return 0.0;
+        };
+        let debt = std::mem::take(&mut self.hicache_pending_io_tokens);
+        let duration_ns = u128::from(debt).saturating_mul(1_000_000_000) / u128::from(rate);
+        duration_ns as f64 / 1_000_000.0
     }
 
     pub(crate) fn apply_command(
@@ -622,6 +668,7 @@ impl SglangCore {
         &mut self,
         now_ms: f64,
     ) -> anyhow::Result<EnginePassResult> {
+        let hicache_io_ms = self.charge_hicache_io_ms();
         let mut admissions = self.promote_prebuilt_ready();
         let materialized_waiting = !self.prebuilt_ready.is_empty();
         apply_schedule_policy(&mut self.waiting, &self.kv_manager, &self.config);
@@ -743,6 +790,7 @@ impl SglangCore {
                     .payloads()
                     .map(|reservation| reservation.request.prompt_len() as u64),
             );
+        let pass_end_ms = decode.end_ms + hicache_io_ms;
         let fpm = build_fpm_snapshot(
             prefill_fpm
                 .iter()
@@ -757,7 +805,7 @@ impl SglangCore {
             scheduled_decode_lens.into_iter(),
             queued_prefills,
             ordinary_queued_decodes.chain(preactivation_decodes),
-            (decode.end_ms - now_ms) / 1000.0,
+            (pass_end_ms - now_ms) / 1000.0,
         );
 
         let accept_length = decode.accept_length;
@@ -768,8 +816,8 @@ impl SglangCore {
         );
         debug_assert_sglang_scheduler_state(&self.waiting, &self.running, self.config.block_size);
         Ok(EnginePassResult {
-            end_ms: decode.end_ms,
-            token_completion_ms: decode.end_ms,
+            end_ms: pass_end_ms,
+            token_completion_ms: pass_end_ms,
             completed_requests: decode
                 .output_signals
                 .iter()
