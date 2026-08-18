@@ -1398,7 +1398,7 @@ mod tests {
     };
     use super::*;
     use crate::common::protocols::{
-        EngineType, G1Backend, SglangArgs, SglangHiCacheArgs, SglangHiCacheStorageLayout,
+        EngineType, G1Backend, SglangArgs, SglangHiCacheArgs, SglangHiCacheSwaCheckpoint,
         SglangHiCacheWritePolicy,
     };
     use crate::loadgen::{AgenticTrace, AgenticTurnTrace, SessionTrace, Trace, TurnTrace};
@@ -1512,6 +1512,7 @@ mod tests {
         MockEngineArgs::builder()
             .engine_type(EngineType::Sglang)
             .block_size(256)
+            .kv_bytes_per_token(Some(1))
             .num_gpu_blocks(64)
             .max_num_batched_tokens(Some(8192))
             .max_num_seqs(Some(4))
@@ -1523,12 +1524,15 @@ mod tests {
                 chunked_prefill_size: Some(512),
                 hicache: Some(SglangHiCacheArgs {
                     write_policy,
-                    l1_swa_capacity_tokens: 512,
-                    l2_full_capacity_tokens: 4096,
-                    l2_swa_capacity_tokens: 1024,
+                    l2_capacity_blocks: 16,
+                    l1_checkpoint_capacity: 2,
+                    l2_checkpoint_capacity: 4,
+                    swa_checkpoint: SglangHiCacheSwaCheckpoint {
+                        interval_tokens: 256,
+                        bytes: 1,
+                    },
                     l3_capacity_gib: 1,
                     io_tokens_per_second: 160_000,
-                    storage_layout: SglangHiCacheStorageLayout::Dsv4FlashTp4AttnCp4Fp32,
                 }),
                 ..Default::default()
             }))
@@ -3006,8 +3010,9 @@ mod tests {
 
         let report = collector.finish();
         let hicache = report.sglang_hicache.expect("HiCache report");
-        assert_eq!(hicache.page_size_tokens, 256);
-        assert_eq!(hicache.full_bundle_bytes_per_page, 9_158_208);
+        assert_eq!(hicache.block_size_tokens, 256);
+        assert_eq!(hicache.full_bytes_per_block, 256);
+        assert_eq!(hicache.swa_checkpoint_bytes, 1);
         assert!(hicache.d2h_tokens > 0);
         assert!(hicache.l3.used_bytes > 0);
         assert_eq!(

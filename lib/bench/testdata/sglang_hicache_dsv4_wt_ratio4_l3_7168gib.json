@@ -1,9 +1,12 @@
 {
   "write_policy": "write_through",
-  "l1_swa_capacity_tokens": 1359360,
-  "l2_full_capacity_tokens": 54382592,
-  "l2_swa_capacity_tokens": 5437440,
+  "l2_capacity_blocks": 212432,
+  "l1_checkpoint_capacity": 5310,
+  "l2_checkpoint_capacity": 21240,
+  "swa_checkpoint": {
+    "interval_tokens": 256,
+    "bytes": 8160000
+  },
   "l3_capacity_gib": 7168,
-  "io_tokens_per_second": 55000,
-  "storage_layout": "dsv4_flash_tp4_attn_cp4_fp32"
+  "io_tokens_per_second": 55000
 }

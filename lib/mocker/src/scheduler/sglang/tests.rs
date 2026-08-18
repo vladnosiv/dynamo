@@ -22,7 +22,7 @@ use super::request::SglangRequest;
 use crate::common::handoff::HandoffId;
 use crate::common::protocols::{
     DirectRequest, EngineType, FpmPublisher, KvEventPublishers, MockEngineArgs, OutputSignal,
-    SglangArgs, SglangHiCacheArgs, SglangHiCacheStorageLayout, SglangHiCacheWritePolicy,
+    SglangArgs, SglangHiCacheArgs, SglangHiCacheSwaCheckpoint, SglangHiCacheWritePolicy,
 };
 use crate::kv_manager::SglangKvManager;
 use crate::kv_manager::sglang_backend::RadixRequestLease;
@@ -79,16 +79,20 @@ fn hicache_host_io_debt_delays_the_next_pass_at_the_calibrated_rate() {
         engine_type: EngineType::Sglang,
         num_gpu_blocks: 8,
         block_size: 256,
+        kv_bytes_per_token: Some(1),
         sglang: Some(SglangArgs {
             page_size: Some(256),
             hicache: Some(SglangHiCacheArgs {
                 write_policy: SglangHiCacheWritePolicy::WriteBack,
-                l1_swa_capacity_tokens: 256,
-                l2_full_capacity_tokens: 256,
-                l2_swa_capacity_tokens: 256,
+                l2_capacity_blocks: 1,
+                l1_checkpoint_capacity: 1,
+                l2_checkpoint_capacity: 1,
+                swa_checkpoint: SglangHiCacheSwaCheckpoint {
+                    interval_tokens: 256,
+                    bytes: 1,
+                },
                 l3_capacity_gib: 1,
                 io_tokens_per_second: 160_000,
-                storage_layout: SglangHiCacheStorageLayout::Dsv4FlashTp4AttnCp4Fp32,
             }),
             ..Default::default()
         }),

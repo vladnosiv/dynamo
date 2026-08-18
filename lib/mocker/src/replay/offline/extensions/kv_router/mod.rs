@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::common::protocols::DirectRequest;
 use crate::common::protocols::MockEngineArgs;
 use crate::kv_manager::SglangHiCacheReport;
-use crate::kv_manager::sglang_backend::is_sglang_hicache_metadata_event;
+use crate::kv_manager::sglang_backend::is_sglang_hicache_checkpoint_event;
 use crate::kv_manager::sglang_hicache::SglangHiCacheState;
 use crate::loadgen::{ReplayRequestHashes, ReplayRequestPayload};
 use crate::replay::offline::components::{KvReplayMetadata, ReplayAdmissionMetadata};
@@ -552,7 +552,19 @@ impl OfflineReplayRouter {
                 .sglang
                 .as_ref()
                 .and_then(|sglang| sglang.hicache.clone())
-                .map(|config| SglangHiCacheState::new(config, args.block_size)),
+                .map(|config| {
+                    let full_bytes_per_block = args
+                        .kv_bytes_per_token
+                        .expect("validated HiCache requires kv_bytes_per_token")
+                        .checked_mul(args.block_size)
+                        .expect("validated FULL block bytes must fit in usize");
+                    SglangHiCacheState::new(
+                        config,
+                        args.block_size,
+                        u64::try_from(full_bytes_per_block)
+                            .expect("FULL block bytes must fit in u64"),
+                    )
+                }),
         })
     }
 
@@ -655,7 +667,7 @@ impl OfflineReplayRouter {
     pub(crate) fn on_kv_events(&mut self, events: Vec<RouterEvent>) -> Result<RouterEffects> {
         let mut host_io_debts = Vec::new();
         for event in events {
-            let metadata_event = is_sglang_hicache_metadata_event(&event.event);
+            let checkpoint_event = is_sglang_hicache_checkpoint_event(&event.event);
             if let Some(hicache) = self.hicache.as_mut() {
                 let tokens = hicache.apply_router_event(&event);
                 if tokens > 0 {
@@ -668,7 +680,7 @@ impl OfflineReplayRouter {
                     });
                 }
             }
-            if metadata_event {
+            if checkpoint_event {
                 continue;
             }
             self.indexer.apply_event(event)?;
@@ -944,9 +956,9 @@ impl OfflineReplayRouter {
     fn refresh_hicache_signals(&self, request: &mut PendingRequest) {
         if let Some(hicache) = self.hicache.as_ref() {
             for (worker, blocks) in &mut request.overlaps.scores {
-                let dsv4_blocks =
+                let reusable_blocks =
                     hicache.device_prefix_blocks(*worker, &request.sequence_block_hashes);
-                *blocks = (*blocks).min(u32::try_from(dsv4_blocks).unwrap_or(u32::MAX));
+                *blocks = (*blocks).min(u32::try_from(reusable_blocks).unwrap_or(u32::MAX));
             }
         }
         let mut tier_overlap_blocks = TierOverlapBlocks::default();
@@ -1182,9 +1194,9 @@ mod tests {
     use super::{OfflineReplayRouter, ReplayRequestHashes, SyncReplayIndexer, WorkerAdmission};
     use crate::common::protocols::{
         DirectRequest, EngineType, MockEngineArgs, SglangArgs, SglangHiCacheArgs,
-        SglangHiCacheStorageLayout, SglangHiCacheWritePolicy,
+        SglangHiCacheSwaCheckpoint, SglangHiCacheWritePolicy,
     };
-    use crate::kv_manager::sglang_backend::SGLANG_HICACHE_METADATA_EVENT_ID_BIT;
+    use crate::kv_manager::sglang_backend::SGLANG_HICACHE_CHECKPOINT_EVENT_ID_BIT;
     use crate::replay::ReplayPrefillLoadEstimator;
 
     struct FixedPrefillLoadEstimator {
@@ -1222,16 +1234,20 @@ mod tests {
         MockEngineArgs::builder()
             .engine_type(EngineType::Sglang)
             .block_size(256)
+            .kv_bytes_per_token(Some(1))
             .sglang(Some(SglangArgs {
                 page_size: Some(256),
                 hicache: Some(SglangHiCacheArgs {
                     write_policy: SglangHiCacheWritePolicy::WriteBack,
-                    l1_swa_capacity_tokens: 256,
-                    l2_full_capacity_tokens: 512,
-                    l2_swa_capacity_tokens: 256,
+                    l2_capacity_blocks: 2,
+                    l1_checkpoint_capacity: 1,
+                    l2_checkpoint_capacity: 1,
+                    swa_checkpoint: SglangHiCacheSwaCheckpoint {
+                        interval_tokens: 256,
+                        bytes: 1,
+                    },
                     l3_capacity_gib: 1,
                     io_tokens_per_second: 160_000,
-                    storage_layout: SglangHiCacheStorageLayout::Dsv4FlashTp4AttnCp4Fp32,
                 }),
                 ..Default::default()
             }))
@@ -1346,12 +1362,12 @@ mod tests {
     }
 
     #[test]
-    fn hicache_metadata_sideband_does_not_enter_primary_index() {
+    fn hicache_checkpoint_sideband_does_not_enter_primary_index() {
         let mut router = OfflineReplayRouter::new(&hicache_replay_args(), None, None, 1).unwrap();
         router
             .on_kv_events(vec![store_event(
                 0,
-                SGLANG_HICACHE_METADATA_EVENT_ID_BIT | 1,
+                SGLANG_HICACHE_CHECKPOINT_EVENT_ID_BIT | 1,
                 77,
                 StorageTier::Device,
             )])

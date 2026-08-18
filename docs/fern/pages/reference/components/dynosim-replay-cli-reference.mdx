@@ -234,78 +234,62 @@ selected profile's `default_policy_family`. For the YAML schema and queue behavi
 ### Experimental SGLang HiCache fields
 
 Offline aggregated SGLang replay can model worker-local L2 plus one shared Mooncake-like L3. The
-current experiment requires `router_mode=kv_router` and `block_size=256`; online and disaggregated
-replay reject this configuration.
+current experiment requires `router_mode=kv_router`; online and disaggregated replay reject this
+configuration.
 
-Configure HiCache inside `sglang` in `--extra-engine-args`. This four-worker example gives the
-shared L3 `4 * 256 GiB` and uses the calibrated write-back host-IO rate:
+Configure HiCache inside `sglang` in `--extra-engine-args`. The ordinary DynoSim fields describe the
+FULL KV representation: `block_size` is its token granularity, `num_gpu_blocks` is L1 FULL capacity,
+and `kv_bytes_per_token * block_size` is its physical size. HiCache adds worker-local L2 capacity,
+one periodic SWA checkpoint sidecar, shared-L3 capacity, and calibrated host IO. This four-worker
+example gives the shared L3 `4 * 256 GiB`:
 
 ```json
 {
   "engine_type": "sglang",
   "block_size": 256,
   "num_gpu_blocks": 53108,
+  "kv_bytes_per_token": 3899,
   "sglang": {
     "page_size": 256,
     "hicache": {
       "write_policy": "write_back",
-      "l1_swa_capacity_tokens": 1359360,
-      "l2_full_capacity_tokens": 54382592,
-      "l2_swa_capacity_tokens": 5437440,
+      "l2_capacity_blocks": 212432,
+      "l1_checkpoint_capacity": 5310,
+      "l2_checkpoint_capacity": 21240,
+      "swa_checkpoint": {
+        "interval_tokens": 256,
+        "bytes": 8160000
+      },
       "l3_capacity_gib": 1024,
-      "io_tokens_per_second": 160000,
-      "storage_layout": "dsv4_flash_tp4_attn_cp4_fp32"
+      "io_tokens_per_second": 160000
     }
 }
 ```
 
-`write_through` serializes the complete physical bundle for each newly admitted logical page to L2
-as soon as its device store becomes visible. `write_back` waits for device eviction and backs up the
-components that are still resident at that boundary. In both modes, L3 receives only successful L2
-backups. `io_tokens_per_second` is an effective calibrated L1↔L2 rate that includes PCIe transfer
-and observed scheduler stalls, not raw link bandwidth. L3→L2 prefetch itself has zero modeled
-transport cost, but every page actually loaded from L2 into L1 accrues H2D debt. Debt is serialized
-per worker and added to its next scheduler pass. Set `l3_capacity_gib` to `0` for a local-L2-only
-control while keeping the same WT/WB and host-IO accounting.
+`swa_checkpoint.interval_tokens` must be a multiple of `block_size`. A prefix is reusable only
+through the last checkpoint whose preceding FULL chain is resident. `l1_checkpoint_capacity` and
+`l2_checkpoint_capacity` count independently evictable checkpoint sidecars; `bytes` affects
+byte-hard L3 accounting. For the current SGLang UnifiedRadixCache configuration, a checkpoint is
+inserted every 256 tokens, but the schema supports any block-aligned interval.
 
-The `dsv4_flash_tp4_attn_cp4_fp32` layout accounts separately for C4, C4 indexer, C128, SWA, C4
-state, and C4-indexer state. L3 enforces the configured GiB capacity in bytes and evicts all resident
-objects for one logical 256-token page as a group. Shared-prefix presence is passed to the existing
-KV-router scoring path through `shared_cache_hits`. When `--router-config` is omitted, HiCache replay
-uses `shared_cache_multiplier=0.5`; an explicit router config remains authoritative. Ordinary SGLang
-KV events do not identify per-page SWA/state residency, so replay emits a private physical-metadata
-sideband that the HiCache mirror consumes without inserting it into the ordinary KV indexer. The
-default SGLang `UnifiedRadixCache` path keeps full SWA and therefore marks every newly completed page;
-the opt-in out-of-window slot-reclamation mode is not modeled by this experiment.
+`write_through` backs up each FULL block when its device store becomes visible and includes the
+checkpoint sidecar at configured boundaries. `write_back` waits for device eviction and backs up the
+FULL block plus its checkpoint only if that checkpoint is still resident. In both modes, L3 receives
+only successful L2 backups. L3 evicts one logical block group at a time: the FULL block and its
+optional checkpoint sidecar leave together.
 
-#### Current parity checkpoint
+`io_tokens_per_second` is an effective calibrated lower-tier rate that includes PCIe constraints and
+observed scheduler stalls, not raw link bandwidth. Every block loaded back into L1 accrues H2D debt;
+L3-to-L2 staging is not charged separately so the calibrated rate is not counted twice. Debt is
+serialized per worker and added to its next scheduler pass. Set `l3_capacity_gib` to `0` for a
+local-L2-only control while keeping the same WT/WB and host-IO accounting.
 
-This research checkpoint uses the 48,749-request Weka Claude Code trace
-`9fa5480ca319a6f43700ba7826da387a5fc77e26390b61e2a09a87d3c39d29a5`, 28 workers, a 7,168 GiB
-L3, ratio-4 L2, 256-token pages, and shared-cache multiplier `0.5`. It compares canonical DynoSim
-replay with the source-span cache-emulator that established the experiment. The DynoSim write-back
-row uses the corrected default full-SWA representation described above.
-
-| Policy / implementation | Admission hit rate | p99 TTFT | Final L3 bytes |
-|---|---:|---:|---:|
-| write-back / cache-emulator | 54.6644% | 5.515 s | 3,955,933,490,688 |
-| write-back / DynoSim | 61.4229% | 4.052 s | 4,341,432,220,992 |
-| write-through / cache-emulator | 69.7441% | 3.285 s | 7,696,576,319,616 |
-| write-through / DynoSim | 70.1130% | 3.078 s | 7,696,576,319,616 |
-
-The write-through final state also matches exactly at 840,402 logical pages. This validates the
-full-bundle byte geometry, hard capacity, and grouped replacement frontier; cumulative insertion and
-eviction still differ because the two schedulers produce different page streams. Full-SWA correction
-moves the DynoSim write-back result toward the source-span reference, but it remains 6.7585 percentage
-points higher in admission hit rate and 385,498,730,304 bytes higher in final L3 occupancy. This is
-not exact write-back parity: SGLang's page-granular radix lifecycle and the reference's source-span
-nodes still produce different publication and replacement streams.
-
-Both implementations derive the same ideal historical-L1 hit bound, 70.5070%. Their ideal p99 TTFT
-values differ (1.208 s in DynoSim versus 1.359 s in the reference) because DynoSim uses its built-in
-polynomial SGLang performance model while the reference uses a calibrated throughput curve plus a
-fixed per-batch overhead. These results therefore validate cache contracts and relative behavior;
-they do not establish hardware latency fidelity.
+Shared-prefix presence reaches the existing KV-router scoring path through `shared_cache_hits`. When
+`--router-config` is omitted, HiCache replay uses `shared_cache_multiplier=0.5`; an explicit router
+config remains authoritative. Ordinary SGLang KV events describe FULL blocks but not independent SWA
+checkpoint eviction. DynoSim therefore carries checkpoint lifecycle in a simulator-private ordered
+sideband and intercepts it before the ordinary KV indexer; checkpoint events never become router KV
+blocks or scores.
 
 ### Engine-timing AIC fields (engine-args JSON)
 
@@ -434,8 +418,8 @@ the configured SGLang performance model, chunked-prefill budget, speedup factors
 step. The nested `distance` object reports realized hit-rate and p99 TTFT gaps plus per-request TTFT
 excess.
 
-When HiCache is enabled, `sglang_hicache` records the physical DSV4 geometry, per-worker L2
-capacities and final occupancy, calibrated IO rate, D2H/H2D token traffic, and byte-hard shared-L3
+When HiCache is enabled, `sglang_hicache` records FULL-block and SWA-checkpoint geometry, per-worker
+L2 capacities and final occupancy, calibrated IO rate, D2H/H2D token traffic, and byte-hard shared-L3
 occupancy, insertion, rejection, and group-eviction counters. Its `route_*` fields are the
 request-level cache potential immediately after the selected worker has been hydrated;
 `admission_*` records what remains when the scheduler actually starts the request and is the reuse

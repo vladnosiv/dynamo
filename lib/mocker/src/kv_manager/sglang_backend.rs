@@ -15,12 +15,13 @@ use dynamo_kv_router::protocols::{
 use rustc_hash::FxHashMap;
 use std::collections::BTreeSet;
 
-/// Simulator-private event-id namespace for DSV4 trailing-state metadata.
-/// Replay intercepts these ordered events before the generic KV indexer.
-pub(crate) const SGLANG_HICACHE_METADATA_EVENT_ID_BIT: u64 = 1_u64 << 63;
+/// Simulator-private event-id namespace for SWA-checkpoint lifecycle events.
+/// Replay intercepts these ordered events before the generic KV indexer, so
+/// they never contribute ordinary router KV blocks or scores.
+pub(crate) const SGLANG_HICACHE_CHECKPOINT_EVENT_ID_BIT: u64 = 1_u64 << 63;
 
-pub(crate) fn is_sglang_hicache_metadata_event(event: &KvCacheEvent) -> bool {
-    event.event_id & SGLANG_HICACHE_METADATA_EVENT_ID_BIT != 0
+pub(crate) fn is_sglang_hicache_checkpoint_event(event: &KvCacheEvent) -> bool {
+    event.event_id & SGLANG_HICACHE_CHECKPOINT_EVENT_ID_BIT != 0
 }
 
 /// Move-only ownership of a request's SGLang KV state.
@@ -127,7 +128,7 @@ pub struct SglangKvManager {
     kv_event_publishers: KvEventPublishers,
     dp_rank: u32,
     next_event_id: u64,
-    next_hicache_metadata_event_id: u64,
+    next_hicache_checkpoint_event_id: u64,
     /// Maps each dense physical page ID to the block hash assigned during
     /// Stored events, so Removed events can use the same block hash.
     page_to_block_hash: Vec<Option<ExternalSequenceBlockHash>>,
@@ -135,15 +136,16 @@ pub struct SglangKvManager {
     /// block hash so router events reflect logical block visibility, not
     /// transient slot ownership.
     block_hash_refcounts: FxHashMap<ExternalSequenceBlockHash, usize>,
-    /// Enables the DSV4 rule that a reusable endpoint needs its trailing
-    /// SWA/state bundle in addition to the packed page chain.
-    dsv4_component_tracking: bool,
-    trailing_state_capacity_pages: usize,
-    trailing_state_clock: u64,
-    page_has_trailing_state: Vec<bool>,
-    page_trailing_access: Vec<u64>,
-    trailing_state_lru: BTreeSet<(u64, KvPageId)>,
-    trailing_pages_by_hash: FxHashMap<ExternalSequenceBlockHash, BTreeSet<KvPageId>>,
+    /// Enables the rule that a reusable prefix must end at a resident periodic
+    /// SWA checkpoint in addition to retaining the ordinary FULL block chain.
+    checkpoint_tracking: bool,
+    checkpoint_interval_pages: usize,
+    checkpoint_capacity: usize,
+    checkpoint_clock: u64,
+    page_has_checkpoint: Vec<bool>,
+    page_checkpoint_access: Vec<u64>,
+    checkpoint_lru: BTreeSet<(u64, KvPageId)>,
+    checkpoint_pages_by_hash: FxHashMap<ExternalSequenceBlockHash, BTreeSet<KvPageId>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -208,19 +210,20 @@ impl SglangKvManager {
         Self::new_internal(total_tokens, page_size, kv_event_publishers, dp_rank, None)
     }
 
-    pub(crate) fn new_with_dsv4_hicache(
+    pub(crate) fn new_with_hicache(
         total_tokens: usize,
         page_size: usize,
         kv_event_publishers: KvEventPublishers,
         dp_rank: u32,
-        l1_swa_capacity_tokens: usize,
+        checkpoint_interval_tokens: usize,
+        checkpoint_capacity: usize,
     ) -> Self {
         Self::new_internal(
             total_tokens,
             page_size,
             kv_event_publishers,
             dp_rank,
-            Some(l1_swa_capacity_tokens / page_size),
+            Some((checkpoint_interval_tokens / page_size, checkpoint_capacity)),
         )
     }
 
@@ -229,11 +232,11 @@ impl SglangKvManager {
         page_size: usize,
         kv_event_publishers: KvEventPublishers,
         dp_rank: u32,
-        trailing_state_capacity_pages: Option<usize>,
+        checkpoint_config: Option<(usize, usize)>,
     ) -> Self {
-        let dsv4_component_tracking = trailing_state_capacity_pages.is_some();
+        let checkpoint_tracking = checkpoint_config.is_some();
         let page_to_block_hash = if kv_event_publishers.is_empty() {
-            if dsv4_component_tracking {
+            if checkpoint_tracking {
                 vec![None; total_tokens / page_size]
             } else {
                 Vec::new()
@@ -241,7 +244,7 @@ impl SglangKvManager {
         } else {
             vec![None; total_tokens / page_size]
         };
-        let page_has_trailing_state = if dsv4_component_tracking {
+        let page_has_checkpoint = if checkpoint_tracking {
             vec![false; total_tokens / page_size]
         } else {
             Vec::new()
@@ -251,20 +254,21 @@ impl SglangKvManager {
             kv_event_publishers,
             dp_rank,
             next_event_id: 0,
-            next_hicache_metadata_event_id: 0,
+            next_hicache_checkpoint_event_id: 0,
             page_to_block_hash,
             block_hash_refcounts: FxHashMap::default(),
-            dsv4_component_tracking,
-            trailing_state_capacity_pages: trailing_state_capacity_pages.unwrap_or(0),
-            trailing_state_clock: 0,
-            page_has_trailing_state,
-            page_trailing_access: if dsv4_component_tracking {
+            checkpoint_tracking,
+            checkpoint_interval_pages: checkpoint_config.map_or(0, |config| config.0),
+            checkpoint_capacity: checkpoint_config.map_or(0, |config| config.1),
+            checkpoint_clock: 0,
+            page_has_checkpoint,
+            page_checkpoint_access: if checkpoint_tracking {
                 vec![0; total_tokens / page_size]
             } else {
                 Vec::new()
             },
-            trailing_state_lru: BTreeSet::new(),
-            trailing_pages_by_hash: FxHashMap::default(),
+            checkpoint_lru: BTreeSet::new(),
+            checkpoint_pages_by_hash: FxHashMap::default(),
         }
     }
 
@@ -337,14 +341,14 @@ impl SglangKvManager {
 
     /// Lower-tier load used by replay after the router has selected a worker.
     /// Packed pages are inserted into the ordinary radix cache and the selected
-    /// endpoint receives its DSV4 trailing SWA/state bundle. The caller charges
+    /// endpoint receives its periodic SWA checkpoint. The caller charges
     /// `loaded_tokens` as serialized H2D debt on the next scheduler pass.
     pub(crate) fn hydrate_prefix_from_hicache(
         &mut self,
         token_ids: &[u32],
         target_pages: usize,
     ) -> HicacheHydration {
-        if !self.dsv4_component_tracking || target_pages == 0 {
+        if !self.checkpoint_tracking || target_pages == 0 {
             return HicacheHydration::default();
         }
         let page_size = self.cache.page_size();
@@ -414,7 +418,7 @@ impl SglangKvManager {
                 .cache
                 .match_prefix_hashes_and_lock(&page_hashes[..target_pages]);
             let pages = self.collect_path_pages_through(last_node, target_pages * page_size);
-            self.mark_trailing_page(pages[target_pages - 1]);
+            self.mark_checkpoint_page(pages[target_pages - 1]);
             self.cache.dec_lock_ref(last_node);
         }
 
@@ -430,11 +434,11 @@ impl SglangKvManager {
         }
     }
 
-    /// Return the complete-page DSV4 prefix reusable by a newly admitted
+    /// Return the complete-block prefix reusable by a newly admitted
     /// request. SGLang resolves this boundary once before chunked prefill; it
     /// does not walk an already-cached long prompt one chunk at a time.
     pub(crate) fn hicache_reusable_prefix_tokens(&mut self, token_ids: &[u32]) -> usize {
-        if !self.dsv4_component_tracking {
+        if !self.checkpoint_tracking {
             return 0;
         }
         let page_size = self.cache.page_size();
@@ -462,8 +466,8 @@ impl SglangKvManager {
             return true;
         }
         assert!(
-            self.dsv4_component_tracking,
-            "HiCache prefix priming requires DSV4 component tracking"
+            self.checkpoint_tracking,
+            "HiCache prefix priming requires SWA checkpoint tracking"
         );
         assert!(!lease.is_active(), "request KV lease is already active");
         let page_size = self.cache.page_size();
@@ -1043,7 +1047,7 @@ impl SglangKvManager {
 
     fn reusable_device_pages(&mut self, page_hashes: &[LocalBlockHash]) -> usize {
         let raw_pages = self.cache.prefix_match_hashes_len(page_hashes) / self.cache.page_size();
-        if !self.dsv4_component_tracking {
+        if !self.checkpoint_tracking {
             return raw_pages;
         }
         let sequence_hashes = Self::sequence_hashes(&page_hashes[..raw_pages]);
@@ -1051,98 +1055,99 @@ impl SglangKvManager {
             .iter()
             .enumerate()
             .filter_map(|(index, hash)| {
-                self.trailing_pages_by_hash
+                self.checkpoint_pages_by_hash
                     .contains_key(hash)
                     .then_some(index + 1)
             })
             .last()
             .unwrap_or(0);
         if reusable > 0 {
-            self.touch_trailing_hash(sequence_hashes[reusable - 1]);
+            self.touch_checkpoint_hash(sequence_hashes[reusable - 1]);
         }
         reusable
     }
 
-    fn mark_trailing_page(&mut self, page: KvPageId) {
-        if !self.dsv4_component_tracking {
+    fn mark_checkpoint_page(&mut self, page: KvPageId) {
+        if !self.checkpoint_tracking {
             return;
         }
         let page_slot = page.index();
-        if self.page_has_trailing_state[page_slot] {
-            self.touch_trailing_page(page);
+        if self.page_has_checkpoint[page_slot] {
+            self.touch_checkpoint_page(page);
             return;
         }
         let Some(block_hash) = self.page_to_block_hash[page_slot] else {
             return;
         };
-        while self.trailing_state_lru.len() >= self.trailing_state_capacity_pages {
-            let Some((_, victim)) = self.trailing_state_lru.pop_first() else {
+        while self.checkpoint_lru.len() >= self.checkpoint_capacity {
+            let Some((_, victim)) = self.checkpoint_lru.pop_first() else {
                 break;
             };
-            self.clear_trailing_page(victim, true);
+            self.clear_checkpoint_page(victim, true);
         }
-        if self.trailing_state_lru.len() >= self.trailing_state_capacity_pages {
+        if self.checkpoint_lru.len() >= self.checkpoint_capacity {
             return;
         }
-        self.page_has_trailing_state[page_slot] = true;
-        let first_for_hash = !self.trailing_pages_by_hash.contains_key(&block_hash);
-        self.trailing_pages_by_hash
+        self.page_has_checkpoint[page_slot] = true;
+        let first_for_hash = !self.checkpoint_pages_by_hash.contains_key(&block_hash);
+        self.checkpoint_pages_by_hash
             .entry(block_hash)
             .or_default()
             .insert(page);
-        self.touch_trailing_page(page);
+        self.touch_checkpoint_page(page);
         if first_for_hash {
-            self.publish_hicache_trailing_stored(block_hash);
+            self.publish_hicache_checkpoint_stored(block_hash);
         }
     }
 
-    fn mark_trailing_pages(&mut self, pages: &[KvPageId]) {
-        // UnifiedRadixCache keeps the default full-SWA representation: every
-        // newly completed page receives its SWA/state bundle. The optional
-        // out-of-window slot reclamation mode is not the SGLang default.
-        for &page in pages {
-            self.mark_trailing_page(page);
+    fn mark_checkpoint_pages(&mut self, pages: &[KvPageId], first_page_index: usize) {
+        if !self.checkpoint_tracking {
+            return;
+        }
+        for (offset, &page) in pages.iter().enumerate() {
+            if (first_page_index + offset + 1) % self.checkpoint_interval_pages == 0 {
+                self.mark_checkpoint_page(page);
+            }
         }
     }
 
-    fn touch_trailing_hash(&mut self, hash: ExternalSequenceBlockHash) {
+    fn touch_checkpoint_hash(&mut self, hash: ExternalSequenceBlockHash) {
         let page = self
-            .trailing_pages_by_hash
+            .checkpoint_pages_by_hash
             .get(&hash)
             .and_then(|pages| pages.first().copied());
         if let Some(page) = page {
-            self.touch_trailing_page(page);
+            self.touch_checkpoint_page(page);
         }
     }
 
-    fn touch_trailing_page(&mut self, page: KvPageId) {
+    fn touch_checkpoint_page(&mut self, page: KvPageId) {
         let page_slot = page.index();
-        if !self.page_has_trailing_state[page_slot] {
+        if !self.page_has_checkpoint[page_slot] {
             return;
         }
-        self.trailing_state_lru
-            .remove(&(self.page_trailing_access[page_slot], page));
-        self.trailing_state_clock = self.trailing_state_clock.saturating_add(1);
-        self.page_trailing_access[page_slot] = self.trailing_state_clock;
-        self.trailing_state_lru
-            .insert((self.trailing_state_clock, page));
+        self.checkpoint_lru
+            .remove(&(self.page_checkpoint_access[page_slot], page));
+        self.checkpoint_clock = self.checkpoint_clock.saturating_add(1);
+        self.page_checkpoint_access[page_slot] = self.checkpoint_clock;
+        self.checkpoint_lru.insert((self.checkpoint_clock, page));
     }
 
-    fn clear_trailing_page(&mut self, page: KvPageId, publish_metadata: bool) {
+    fn clear_checkpoint_page(&mut self, page: KvPageId, publish_event: bool) {
         let page_slot = page.index();
-        if !self.page_has_trailing_state[page_slot] {
+        if !self.page_has_checkpoint[page_slot] {
             return;
         }
-        self.trailing_state_lru
-            .remove(&(self.page_trailing_access[page_slot], page));
-        self.page_has_trailing_state[page_slot] = false;
-        self.page_trailing_access[page_slot] = 0;
+        self.checkpoint_lru
+            .remove(&(self.page_checkpoint_access[page_slot], page));
+        self.page_has_checkpoint[page_slot] = false;
+        self.page_checkpoint_access[page_slot] = 0;
         let Some(block_hash) = self.page_to_block_hash[page_slot] else {
             return;
         };
         let mut last_for_hash = false;
         if let std::collections::hash_map::Entry::Occupied(mut entry) =
-            self.trailing_pages_by_hash.entry(block_hash)
+            self.checkpoint_pages_by_hash.entry(block_hash)
         {
             entry.get_mut().remove(&page);
             if entry.get().is_empty() {
@@ -1150,26 +1155,27 @@ impl SglangKvManager {
                 last_for_hash = true;
             }
         }
-        if publish_metadata && last_for_hash {
-            self.publish_hicache_trailing_removed(block_hash);
+        if publish_event && last_for_hash {
+            self.publish_hicache_checkpoint_removed(block_hash);
         }
     }
 
-    fn next_hicache_metadata_event_id(&mut self) -> u64 {
-        let event_id = SGLANG_HICACHE_METADATA_EVENT_ID_BIT | self.next_hicache_metadata_event_id;
-        self.next_hicache_metadata_event_id = self
-            .next_hicache_metadata_event_id
+    fn next_hicache_checkpoint_event_id(&mut self) -> u64 {
+        let event_id =
+            SGLANG_HICACHE_CHECKPOINT_EVENT_ID_BIT | self.next_hicache_checkpoint_event_id;
+        self.next_hicache_checkpoint_event_id = self
+            .next_hicache_checkpoint_event_id
             .checked_add(1)
-            .expect("SGLang HiCache metadata event ID overflow");
+            .expect("SGLang HiCache checkpoint event ID overflow");
         event_id
     }
 
-    fn publish_hicache_trailing_stored(&mut self, block_hash: ExternalSequenceBlockHash) {
+    fn publish_hicache_checkpoint_stored(&mut self, block_hash: ExternalSequenceBlockHash) {
         if self.kv_event_publishers.is_empty() {
             return;
         }
         let event = KvCacheEvent {
-            event_id: self.next_hicache_metadata_event_id(),
+            event_id: self.next_hicache_checkpoint_event_id(),
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: None,
                 start_position: None,
@@ -1185,16 +1191,16 @@ impl SglangKvManager {
             self.kv_event_publishers
                 .publish_with_storage_tier(event, None, StorageTier::HostPinned)
         {
-            tracing::warn!(%error, "failed to publish SGLang HiCache trailing-store metadata");
+            tracing::warn!(%error, "failed to publish SGLang HiCache checkpoint-store event");
         }
     }
 
-    fn publish_hicache_trailing_removed(&mut self, block_hash: ExternalSequenceBlockHash) {
+    fn publish_hicache_checkpoint_removed(&mut self, block_hash: ExternalSequenceBlockHash) {
         if self.kv_event_publishers.is_empty() {
             return;
         }
         let event = KvCacheEvent {
-            event_id: self.next_hicache_metadata_event_id(),
+            event_id: self.next_hicache_checkpoint_event_id(),
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![block_hash],
             }),
@@ -1204,7 +1210,7 @@ impl SglangKvManager {
             self.kv_event_publishers
                 .publish_with_storage_tier(event, None, StorageTier::HostPinned)
         {
-            tracing::warn!(%error, "failed to publish SGLang HiCache trailing-remove metadata");
+            tracing::warn!(%error, "failed to publish SGLang HiCache checkpoint-remove event");
         }
     }
 
@@ -1215,7 +1221,7 @@ impl SglangKvManager {
         num_tokens: usize,
         first_new_token: usize,
     ) -> usize {
-        if self.kv_event_publishers.is_empty() && !self.dsv4_component_tracking {
+        if self.kv_event_publishers.is_empty() && !self.checkpoint_tracking {
             return 0;
         }
         if self.page_to_block_hash.is_empty() {
@@ -1240,7 +1246,7 @@ impl SglangKvManager {
         let Some(first_unpublished_page) = (first_page..complete_pages)
             .find(|&page_idx| self.page_to_block_hash[pages[page_idx].index()].is_none())
         else {
-            self.mark_trailing_pages(&pages[first_page..complete_pages]);
+            self.mark_checkpoint_pages(&pages[first_page..complete_pages], first_page);
             return 0;
         };
 
@@ -1287,7 +1293,7 @@ impl SglangKvManager {
 
         let hashed_blocks = local_hashes.len();
         if blocks.is_empty() {
-            self.mark_trailing_pages(&pages[first_page..complete_pages]);
+            self.mark_checkpoint_pages(&pages[first_page..complete_pages], first_page);
             return hashed_blocks;
         }
 
@@ -1305,23 +1311,23 @@ impl SglangKvManager {
         if let Err(e) = self.kv_event_publishers.publish(event, None) {
             tracing::warn!("Failed to publish SGLang KV event: {e}");
         }
-        self.mark_trailing_pages(&pages[first_page..complete_pages]);
+        self.mark_checkpoint_pages(&pages[first_page..complete_pages], first_page);
 
         hashed_blocks
     }
 
     fn publish_removed_pages(&mut self, evicted_pages: &[KvPageId]) {
-        if self.kv_event_publishers.is_empty() && !self.dsv4_component_tracking {
+        if self.kv_event_publishers.is_empty() && !self.checkpoint_tracking {
             return;
         }
 
         let mut block_hashes = Vec::new();
         for (page_idx, &page) in evicted_pages.iter().enumerate() {
             let page_slot = page.index();
-            if self.dsv4_component_tracking && self.page_has_trailing_state[page_slot] {
-                // Preserve the mirror's trailing bit until the following
+            if self.checkpoint_tracking && self.page_has_checkpoint[page_slot] {
+                // Preserve the mirror's checkpoint bit until the following
                 // Device Removed event so write-back captures the full bundle.
-                self.clear_trailing_page(page, false);
+                self.clear_checkpoint_page(page, false);
             }
             let Some(block_hash) = self.page_to_block_hash[page_slot].take() else {
                 continue;
@@ -1853,10 +1859,10 @@ mod tests {
     }
 
     #[test]
-    fn dsv4_full_swa_marks_every_newly_completed_page() {
+    fn hicache_marks_swa_checkpoints_at_the_configured_interval() {
         let mut mgr =
-            SglangKvManager::new_with_dsv4_hicache(16, 4, KvEventPublishers::default(), 0, 16);
-        let tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+            SglangKvManager::new_with_hicache(20, 4, KvEventPublishers::default(), 0, 8, 16);
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let mut alloc = mgr.allocate_for_request(&tokens[..3]).unwrap();
 
         assert!(mgr.extend_allocation(&tokens[..10], &mut alloc.lease));
@@ -1864,20 +1870,21 @@ mod tests {
         assert_eq!(
             pages
                 .iter()
-                .map(|page| mgr.page_has_trailing_state[page.index()])
+                .map(|page| mgr.page_has_checkpoint[page.index()])
                 .collect::<Vec<_>>(),
-            vec![true, true, false],
-            "both complete pages in one chunk need SWA/state; the partial tail does not"
+            vec![false, true, false],
+            "only the second complete block crosses the eight-token checkpoint interval"
         );
 
         assert!(mgr.extend_allocation(&tokens, &mut alloc.lease));
-        assert!(
+        assert_eq!(
             alloc
                 .lease
                 .pages()
                 .iter()
-                .all(|page| mgr.page_has_trailing_state[page.index()]),
-            "completing the partial tail must publish its SWA/state bundle"
+                .map(|page| mgr.page_has_checkpoint[page.index()])
+                .collect::<Vec<_>>(),
+            vec![false, true, false, true]
         );
     }
 

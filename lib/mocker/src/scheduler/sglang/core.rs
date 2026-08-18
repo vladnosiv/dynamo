@@ -140,12 +140,13 @@ impl SglangCore {
             hicache_config.map(|hicache| hicache.io_tokens_per_second);
 
         let kv_manager = if let Some(hicache) = hicache_config {
-            SglangKvManager::new_with_dsv4_hicache(
+            SglangKvManager::new_with_hicache(
                 total_tokens,
                 args.block_size,
                 kv_event_publishers,
                 dp_rank,
-                hicache.l1_swa_capacity_tokens,
+                hicache.swa_checkpoint.interval_tokens,
+                hicache.l1_checkpoint_capacity,
             )
         } else {
             SglangKvManager::new(total_tokens, args.block_size, kv_event_publishers, dp_rank)

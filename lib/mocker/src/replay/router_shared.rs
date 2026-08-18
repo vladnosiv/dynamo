@@ -128,9 +128,8 @@ pub(crate) fn replay_router_config(
             .and_then(|sglang| sglang.hicache.as_ref())
             .is_some()
     {
-        // Match Dynamo's shared-cache-aware policy and the cache-emulator
-        // baseline: shared pages beyond the local device prefix receive half
-        // credit. Callers can still override this through KvRouterConfig.
+        // Shared blocks beyond the local device prefix receive half credit by
+        // default. Callers can still override this through KvRouterConfig.
         config.shared_cache_multiplier = 0.5;
     }
     if let Some(policy) = args.router_queue_policy {
@@ -143,7 +142,7 @@ pub(crate) fn replay_router_config(
 mod tests {
     use super::*;
     use crate::common::protocols::{
-        EngineType, SglangArgs, SglangHiCacheArgs, SglangHiCacheStorageLayout,
+        EngineType, SglangArgs, SglangHiCacheArgs, SglangHiCacheSwaCheckpoint,
         SglangHiCacheWritePolicy,
     };
 
@@ -151,16 +150,20 @@ mod tests {
         MockEngineArgs::builder()
             .engine_type(EngineType::Sglang)
             .block_size(256)
+            .kv_bytes_per_token(Some(1))
             .sglang(Some(SglangArgs {
                 page_size: Some(256),
                 hicache: Some(SglangHiCacheArgs {
                     write_policy: SglangHiCacheWritePolicy::WriteBack,
-                    l1_swa_capacity_tokens: 256,
-                    l2_full_capacity_tokens: 256,
-                    l2_swa_capacity_tokens: 256,
+                    l2_capacity_blocks: 1,
+                    l1_checkpoint_capacity: 1,
+                    l2_checkpoint_capacity: 1,
+                    swa_checkpoint: SglangHiCacheSwaCheckpoint {
+                        interval_tokens: 256,
+                        bytes: 1,
+                    },
                     l3_capacity_gib: 1,
                     io_tokens_per_second: 160_000,
-                    storage_layout: SglangHiCacheStorageLayout::Dsv4FlashTp4AttnCp4Fp32,
                 }),
                 ..Default::default()
             }))
