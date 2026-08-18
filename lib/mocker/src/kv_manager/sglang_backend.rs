@@ -1096,6 +1096,15 @@ impl SglangKvManager {
         }
     }
 
+    fn mark_trailing_pages(&mut self, pages: &[KvPageId]) {
+        // UnifiedRadixCache keeps the default full-SWA representation: every
+        // newly completed page receives its SWA/state bundle. The optional
+        // out-of-window slot reclamation mode is not the SGLang default.
+        for &page in pages {
+            self.mark_trailing_page(page);
+        }
+    }
+
     fn touch_trailing_hash(&mut self, hash: ExternalSequenceBlockHash) {
         let page = self
             .trailing_pages_by_hash
@@ -1231,7 +1240,7 @@ impl SglangKvManager {
         let Some(first_unpublished_page) = (first_page..complete_pages)
             .find(|&page_idx| self.page_to_block_hash[pages[page_idx].index()].is_none())
         else {
-            self.mark_trailing_page(pages[complete_pages - 1]);
+            self.mark_trailing_pages(&pages[first_page..complete_pages]);
             return 0;
         };
 
@@ -1278,7 +1287,7 @@ impl SglangKvManager {
 
         let hashed_blocks = local_hashes.len();
         if blocks.is_empty() {
-            self.mark_trailing_page(pages[complete_pages - 1]);
+            self.mark_trailing_pages(&pages[first_page..complete_pages]);
             return hashed_blocks;
         }
 
@@ -1296,7 +1305,7 @@ impl SglangKvManager {
         if let Err(e) = self.kv_event_publishers.publish(event, None) {
             tracing::warn!("Failed to publish SGLang KV event: {e}");
         }
-        self.mark_trailing_page(pages[complete_pages - 1]);
+        self.mark_trailing_pages(&pages[first_page..complete_pages]);
 
         hashed_blocks
     }
@@ -1841,6 +1850,35 @@ mod tests {
         assert_eq!(first.blocks.len(), 1);
         assert_eq!(second.blocks.len(), 1);
         assert_eq!(second.parent_hash, Some(first.blocks[0].block_hash));
+    }
+
+    #[test]
+    fn dsv4_full_swa_marks_every_newly_completed_page() {
+        let mut mgr =
+            SglangKvManager::new_with_dsv4_hicache(16, 4, KvEventPublishers::default(), 0, 16);
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut alloc = mgr.allocate_for_request(&tokens[..3]).unwrap();
+
+        assert!(mgr.extend_allocation(&tokens[..10], &mut alloc.lease));
+        let pages = alloc.lease.pages();
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| mgr.page_has_trailing_state[page.index()])
+                .collect::<Vec<_>>(),
+            vec![true, true, false],
+            "both complete pages in one chunk need SWA/state; the partial tail does not"
+        );
+
+        assert!(mgr.extend_allocation(&tokens, &mut alloc.lease));
+        assert!(
+            alloc
+                .lease
+                .pages()
+                .iter()
+                .all(|page| mgr.page_has_trailing_state[page.index()]),
+            "completing the partial tail must publish its SWA/state bundle"
+        );
     }
 
     #[test]
