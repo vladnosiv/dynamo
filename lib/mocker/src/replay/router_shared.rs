@@ -119,9 +119,84 @@ pub(crate) fn replay_router_config(
     args: &MockEngineArgs,
     router_config: Option<KvRouterConfig>,
 ) -> KvRouterConfig {
+    let explicit_router_config = router_config.is_some();
     let mut config = router_config.unwrap_or_default();
+    if !explicit_router_config
+        && args
+            .sglang
+            .as_ref()
+            .and_then(|sglang| sglang.hicache.as_ref())
+            .is_some()
+    {
+        // Match Dynamo's shared-cache-aware policy and the cache-emulator
+        // baseline: shared pages beyond the local device prefix receive half
+        // credit. Callers can still override this through KvRouterConfig.
+        config.shared_cache_multiplier = 0.5;
+    }
     if let Some(policy) = args.router_queue_policy {
         config.router_queue_policy = policy;
     }
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::protocols::{
+        EngineType, SglangArgs, SglangHiCacheArgs, SglangHiCacheStorageLayout,
+        SglangHiCacheWritePolicy,
+    };
+
+    fn hicache_args() -> MockEngineArgs {
+        MockEngineArgs::builder()
+            .engine_type(EngineType::Sglang)
+            .block_size(256)
+            .sglang(Some(SglangArgs {
+                page_size: Some(256),
+                hicache: Some(SglangHiCacheArgs {
+                    write_policy: SglangHiCacheWritePolicy::WriteBack,
+                    l1_swa_capacity_tokens: 256,
+                    l2_full_capacity_tokens: 256,
+                    l2_swa_capacity_tokens: 256,
+                    l3_capacity_gib: 1,
+                    io_tokens_per_second: 160_000,
+                    storage_layout: SglangHiCacheStorageLayout::Dsv4FlashTp4AttnCp4Fp32,
+                }),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn hicache_default_router_credits_shared_prefix() {
+        let args = hicache_args();
+        assert_eq!(
+            replay_router_config(&args, None).shared_cache_multiplier,
+            0.5
+        );
+        let metadata = crate::replay::canonical_router_metadata_for_args(
+            crate::replay::ReplayRouterMode::KvRouter,
+            None,
+            &args,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.config.unwrap().shared_cache_multiplier,
+            0.5,
+            "canonical provenance must record the effective runtime default"
+        );
+    }
+
+    #[test]
+    fn explicit_router_config_controls_shared_prefix_weight() {
+        let explicit = KvRouterConfig {
+            shared_cache_multiplier: 0.25,
+            ..Default::default()
+        };
+        assert_eq!(
+            replay_router_config(&hicache_args(), Some(explicit)).shared_cache_multiplier,
+            0.25
+        );
+    }
 }

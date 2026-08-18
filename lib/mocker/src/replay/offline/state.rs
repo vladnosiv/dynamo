@@ -8,6 +8,7 @@ use crate::common::handoff::{
 };
 use crate::common::protocols::DirectRequest;
 use crate::common::protocols::MockEngineArgs;
+use crate::kv_manager::sglang_backend::HicacheHydration;
 use crate::loadgen::{ReplayRequestHashes, ReplayRequestPayload};
 use crate::scheduler::{
     EngineCore, EnginePassResult, SchedulerCommand, SchedulerCommandEffects,
@@ -331,6 +332,18 @@ impl OfflineWorkerState {
             .expect("offline worker in-flight request count overflow");
         request.dp_rank = self.dp_rank;
         self.core.receive(request);
+    }
+
+    pub(crate) fn hydrate_sglang_prefix(
+        &mut self,
+        token_ids: &[u32],
+        target_pages: usize,
+    ) -> HicacheHydration {
+        self.core.hydrate_sglang_prefix(token_ids, target_pages)
+    }
+
+    pub(crate) fn record_sglang_hicache_io_tokens(&mut self, tokens: usize) {
+        self.core.record_sglang_hicache_io_tokens(tokens);
     }
 
     pub(crate) fn apply_command(

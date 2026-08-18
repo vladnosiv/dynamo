@@ -22,7 +22,7 @@ use super::request::SglangRequest;
 use crate::common::handoff::HandoffId;
 use crate::common::protocols::{
     DirectRequest, EngineType, FpmPublisher, KvEventPublishers, MockEngineArgs, OutputSignal,
-    SglangArgs,
+    SglangArgs, SglangHiCacheArgs, SglangHiCacheStorageLayout, SglangHiCacheWritePolicy,
 };
 use crate::kv_manager::SglangKvManager;
 use crate::kv_manager::sglang_backend::RadixRequestLease;
@@ -71,6 +71,37 @@ fn direct_request(tokens: Vec<u32>, max_output_tokens: usize) -> DirectRequest {
         arrival_timestamp_ms: None,
         ..Default::default()
     }
+}
+
+#[test]
+fn hicache_host_io_debt_delays_the_next_pass_at_the_calibrated_rate() {
+    let args = MockEngineArgs {
+        engine_type: EngineType::Sglang,
+        num_gpu_blocks: 8,
+        block_size: 256,
+        sglang: Some(SglangArgs {
+            page_size: Some(256),
+            hicache: Some(SglangHiCacheArgs {
+                write_policy: SglangHiCacheWritePolicy::WriteBack,
+                l1_swa_capacity_tokens: 256,
+                l2_full_capacity_tokens: 256,
+                l2_swa_capacity_tokens: 256,
+                l3_capacity_gib: 1,
+                io_tokens_per_second: 160_000,
+                storage_layout: SglangHiCacheStorageLayout::Dsv4FlashTp4AttnCp4Fp32,
+            }),
+            ..Default::default()
+        }),
+        ..MockEngineArgs::default()
+    };
+    let mut core = SglangCore::new(args);
+    core.record_hicache_io_tokens(256);
+
+    let pass = core.execute_pass_internal(10.0);
+
+    assert!((pass.end_ms - 11.6).abs() < 1e-9);
+    assert!((pass.token_completion_ms - 11.6).abs() < 1e-9);
+    assert_eq!(core.execute_pass_internal(11.6).end_ms, 11.6);
 }
 
 #[test]

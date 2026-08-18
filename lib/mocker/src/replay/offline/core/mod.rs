@@ -9,6 +9,8 @@
 use anyhow::Result;
 use uuid::Uuid;
 
+use crate::kv_manager::SglangHiCacheReport;
+
 pub(crate) mod round_robin;
 
 pub(crate) trait RequestIdentity {
@@ -52,6 +54,10 @@ pub(crate) struct Placement {
     pub(in crate::replay::offline) scheduler_id: usize,
     pub(in crate::replay::offline) reported_overlap_tokens: usize,
     pub(in crate::replay::offline) planner_cache_sample: Option<PlannerCacheSample>,
+    /// SGLang HiCache prefix boundary to make reusable before worker
+    /// admission. Any newly loaded L1 pages accrue H2D debt on the selected
+    /// scheduler; already-device-resident pages are only verified.
+    pub(in crate::replay::offline) hicache_target_pages: usize,
 }
 
 #[derive(Debug)]
@@ -64,6 +70,12 @@ pub(crate) enum PlacementDecision {
 pub(crate) struct PlacementEffects {
     pub(crate) decision: PlacementDecision,
     pub(crate) released: Vec<Placement>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkerHostIoDebt {
+    pub(in crate::replay::offline) scheduler_id: usize,
+    pub(in crate::replay::offline) tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +96,12 @@ pub(crate) trait PlacementPolicy<Request> {
         now_ms: f64,
     ) -> Result<PlacementEffects>;
     fn observe(&mut self, observation: Self::Observation, now_ms: f64) -> Result<Vec<Placement>>;
+    fn drain_host_io_debts(&mut self) -> Vec<WorkerHostIoDebt> {
+        Vec::new()
+    }
+    fn sglang_hicache_report(&self) -> Option<SglangHiCacheReport> {
+        None
+    }
     fn cancel_pending(&mut self, request_id: Uuid) -> bool;
     fn request_terminal(&mut self, request_id: Uuid, now_ms: f64) -> Result<Vec<Placement>>;
     fn prefill_completed(&mut self, request_id: Uuid, now_ms: f64) -> Result<Vec<Placement>>;

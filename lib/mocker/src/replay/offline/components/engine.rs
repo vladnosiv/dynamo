@@ -567,6 +567,29 @@ where
         Ok(())
     }
 
+    pub(in crate::replay::offline) fn hydrate_sglang_prefix(
+        &mut self,
+        rank_id: usize,
+        token_ids: &[u32],
+        target_pages: usize,
+    ) -> anyhow::Result<crate::kv_manager::sglang_backend::HicacheHydration> {
+        self.update_worker(rank_id, |worker| {
+            worker.hydrate_sglang_prefix(token_ids, target_pages)
+        })
+        .ok_or_else(|| anyhow::anyhow!("offline replay selected unknown rank {rank_id}"))
+    }
+
+    pub(in crate::replay::offline) fn record_sglang_hicache_io_tokens(
+        &mut self,
+        rank_id: usize,
+        tokens: usize,
+    ) -> anyhow::Result<()> {
+        self.update_worker(rank_id, |worker| {
+            worker.record_sglang_hicache_io_tokens(tokens)
+        })
+        .ok_or_else(|| anyhow::anyhow!("offline replay selected unknown rank {rank_id}"))
+    }
+
     pub(in crate::replay::offline) fn apply_command(
         &mut self,
         rank_id: usize,

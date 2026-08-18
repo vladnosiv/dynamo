@@ -535,6 +535,57 @@ impl ReasoningConfig {
     }
 }
 
+/// SGLang HiCache write policy modeled by DynoSim.
+///
+/// These are the two policies supported by upstream SGLang. Experimental
+/// policies intentionally stay out of the mocker contract until their runtime
+/// semantics exist outside the simulator.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SglangHiCacheWritePolicy {
+    WriteBack,
+    #[default]
+    WriteThrough,
+}
+
+/// Physical storage geometry used for byte-accounted shared L3 simulation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SglangHiCacheStorageLayout {
+    /// DeepSeek-V4-Flash, TP4 / attention-CP4, FP32 compressed states.
+    #[default]
+    Dsv4FlashTp4AttnCp4Fp32,
+}
+
+/// SGLang HiCache configuration for replay.
+///
+/// L1/L2 capacities use the same token accounting as the calibrated emulator.
+/// Shared L3 capacity is configured in GiB but enforced internally in bytes.
+/// Host IO is charged as an effective serialized token rate; this represents
+/// measured PCIe transfer plus scheduler stalls rather than raw link bandwidth.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct SglangHiCacheArgs {
+    #[serde(default)]
+    pub write_policy: SglangHiCacheWritePolicy,
+    /// Device capacity for the trailing SWA/state bundle.
+    #[validate(range(min = 1))]
+    pub l1_swa_capacity_tokens: usize,
+    /// Host capacity for packed C4/C128/indexer pages.
+    #[validate(range(min = 1))]
+    pub l2_full_capacity_tokens: usize,
+    /// Host capacity for the trailing SWA/state bundle.
+    #[validate(range(min = 1))]
+    pub l2_swa_capacity_tokens: usize,
+    /// Shared Mooncake-like L3 capacity. One GiB is exactly 2^30 bytes; zero
+    /// keeps worker-local L2 enabled while disabling shared L3 admission.
+    pub l3_capacity_gib: u64,
+    /// Effective serialized L1<->L2 rate in logical tokens per second.
+    #[validate(range(min = 1))]
+    pub io_tokens_per_second: u64,
+    #[serde(default)]
+    pub storage_layout: SglangHiCacheStorageLayout,
+}
+
 /// SGLang-specific configuration parameters.
 ///
 /// Grouped into a nested struct to keep the `MockEngineArgs` namespace clean,
@@ -558,6 +609,9 @@ pub struct SglangArgs {
     /// Schedule conservativeness factor (0.0–1.0). Default: 1.0.
     #[validate(range(min = 0.0, max = 1.0))]
     pub schedule_conservativeness: Option<f64>,
+    /// Optional hierarchical cache simulation for offline replay.
+    #[validate(nested)]
+    pub hicache: Option<SglangHiCacheArgs>,
 }
 
 /// TensorRT-LLM-specific configuration parameters.
@@ -1052,6 +1106,55 @@ fn validate_mock_engine_args(args: &MockEngineArgs) -> Result<(), ValidationErro
             "g1_backend=native cannot be combined with KVBM G2/G3/G4 offload; omit g1_backend to select KVBM automatically or set g1_backend=kvbm explicitly"
                 .to_string(),
         ));
+    }
+
+    if let Some(hicache) = args
+        .sglang
+        .as_ref()
+        .and_then(|sglang| sglang.hicache.as_ref())
+    {
+        if args.engine_type != EngineType::Sglang {
+            return Err(mock_engine_args_validation_error(
+                "sglang_hicache_requires_sglang",
+                format!(
+                    "sglang.hicache requires engine_type=sglang, got engine_type={:?}",
+                    args.engine_type
+                ),
+            ));
+        }
+        if args.block_size != 256 {
+            return Err(mock_engine_args_validation_error(
+                "sglang_hicache_dsv4_page_size",
+                format!(
+                    "the DSV4 HiCache storage layout requires block_size=256, got {}",
+                    args.block_size
+                ),
+            ));
+        }
+        if hicache.l1_swa_capacity_tokens % args.block_size != 0
+            || hicache.l2_full_capacity_tokens % args.block_size != 0
+            || hicache.l2_swa_capacity_tokens % args.block_size != 0
+        {
+            return Err(mock_engine_args_validation_error(
+                "sglang_hicache_l2_page_alignment",
+                format!(
+                    "sglang.hicache L1/L2 capacities must be multiples of block_size={}, got l1_swa={}, l2_full={}, and l2_swa={}",
+                    args.block_size,
+                    hicache.l1_swa_capacity_tokens,
+                    hicache.l2_full_capacity_tokens,
+                    hicache.l2_swa_capacity_tokens
+                ),
+            ));
+        }
+        if hicache.l3_capacity_gib.checked_mul(1_u64 << 30).is_none() {
+            return Err(mock_engine_args_validation_error(
+                "sglang_hicache_l3_capacity_overflow",
+                format!(
+                    "sglang.hicache l3_capacity_gib={} overflows byte capacity",
+                    hicache.l3_capacity_gib
+                ),
+            ));
+        }
     }
 
     if args.num_g3_blocks.is_some() && args.num_g2_blocks.is_none() {

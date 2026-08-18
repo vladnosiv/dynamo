@@ -13,8 +13,9 @@ use dynamo_kv_router::config::KvRouterConfig;
 #[cfg(test)]
 pub(in crate::replay) use dynamo_kv_router::config::RouterQueuePolicy;
 use dynamo_kv_router::protocols::{
-    BlockHashOptions, OverlapScores, PrefillLoadHint, RouterEvent, RoutingConstraints,
-    WorkerConfigLike, WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
+    BlockHashOptions, ExternalSequenceBlockHash, OverlapScores, PrefillLoadHint, RouterEvent,
+    RoutingConstraints, SharedCacheHits, WorkerConfigLike, WorkerId, WorkerWithDpRank,
+    compute_block_hash_for_seq,
 };
 use dynamo_kv_router::queue::DEFAULT_MAX_BATCHED_TOKENS;
 use dynamo_kv_router::scheduling::{
@@ -35,11 +36,14 @@ use uuid::Uuid;
 
 use crate::common::protocols::DirectRequest;
 use crate::common::protocols::MockEngineArgs;
+use crate::kv_manager::SglangHiCacheReport;
+use crate::kv_manager::sglang_backend::is_sglang_hicache_metadata_event;
+use crate::kv_manager::sglang_hicache::SglangHiCacheState;
 use crate::loadgen::{ReplayRequestHashes, ReplayRequestPayload};
 use crate::replay::offline::components::{KvReplayMetadata, ReplayAdmissionMetadata};
 use crate::replay::offline::core::{
     Placement, PlacementDecision, PlacementEffects, PlacementPolicy, PlannerCacheSample,
-    WorkerTopology,
+    WorkerHostIoDebt, WorkerTopology,
 };
 use crate::replay::offline::extensions::kv_events::RouterEventBatch;
 use crate::replay::router_shared::{
@@ -149,11 +153,13 @@ pub(crate) struct WorkerAdmission {
     worker_idx: usize,
     overlap_blocks: u32,
     isl_blocks: u32,
+    hicache_target_pages: usize,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct RouterEffects {
     admissions: Vec<WorkerAdmission>,
+    host_io_debts: Vec<WorkerHostIoDebt>,
 }
 
 /// Internal result of a successful ``admit_request`` call: the chosen
@@ -164,6 +170,7 @@ struct AdmitOutcome {
     worker_idx: usize,
     overlap_blocks: u32,
     isl_blocks: u32,
+    hicache_target_pages: usize,
 }
 
 #[cfg(test)]
@@ -191,32 +198,18 @@ pub(crate) struct OfflineRouterSnapshot {
 }
 
 struct SyncReplayIndexer {
-    block_size: u32,
     tree: RadixTree,
 }
 
 impl SyncReplayIndexer {
-    fn new(block_size: u32) -> Self {
+    fn new() -> Self {
         Self {
-            block_size,
             tree: RadixTree::new(),
         }
     }
 
-    fn find_matches_for_request(&self, tokens: &[u32], lora_name: Option<&str>) -> OverlapScores {
-        let sequence = compute_block_hash_for_seq(
-            tokens,
-            self.block_size,
-            BlockHashOptions {
-                lora_name,
-                ..Default::default()
-            },
-        );
-        self.tree.find_matches(sequence, false)
-    }
-
-    fn find_matches_for_hashes(&self, local_block_hashes: Vec<LocalBlockHash>) -> OverlapScores {
-        self.tree.find_matches(local_block_hashes, false)
+    fn find_matches_for_hashes(&self, local_block_hashes: &[LocalBlockHash]) -> OverlapScores {
+        self.tree.find_matches(local_block_hashes.to_vec(), false)
     }
 
     fn apply_event(&mut self, event: RouterEvent) -> Result<()> {
@@ -250,6 +243,10 @@ struct PendingRequest {
     token_seq: Option<Vec<SequenceHash>>,
     isl_tokens: usize,
     overlaps: OverlapScores,
+    sequence_block_hashes: Vec<ExternalSequenceBlockHash>,
+    tier_overlap_blocks: TierOverlapBlocks,
+    shared_cache_hits: Option<SharedCacheHits>,
+    host_cache_hit_weight: f64,
     track_prefill_tokens: bool,
     expected_output_tokens: Option<u32>,
     priority_jump: f64,
@@ -268,17 +265,19 @@ impl PendingRequest {
         block_size: usize,
         worker_loads: FxHashMap<WorkerWithDpRank, WorkerLoadProjection>,
     ) -> SchedulingRequest {
-        let effective_overlap_blocks = self
+        let mut effective_overlap_blocks: HashMap<WorkerWithDpRank, f64> = self
             .overlaps
             .scores
             .iter()
             .map(|(worker, overlap)| (*worker, *overlap as f64))
             .collect();
-        let effective_cached_tokens = self
-            .overlaps
-            .scores
+        for (worker, extension) in &self.tier_overlap_blocks.host_pinned {
+            *effective_overlap_blocks.entry(*worker).or_insert(0.0) +=
+                *extension as f64 * self.host_cache_hit_weight;
+        }
+        let effective_cached_tokens = effective_overlap_blocks
             .iter()
-            .map(|(worker, overlap)| (*worker, *overlap as usize * block_size))
+            .map(|(worker, overlap)| (*worker, (*overlap * block_size as f64).round() as usize))
             .collect();
         SchedulingRequest {
             mode: ScheduleMode::Tracked {
@@ -287,7 +286,7 @@ impl PendingRequest {
             token_seq: self.token_seq.clone(),
             isl_tokens: self.isl_tokens,
             overlap: OverlapSignals {
-                tier_overlap_blocks: TierOverlapBlocks::default(),
+                tier_overlap_blocks: self.tier_overlap_blocks.clone(),
                 effective_overlap_blocks,
                 effective_cached_tokens,
             },
@@ -308,7 +307,7 @@ impl PendingRequest {
             pinned_worker: None,
             allowed_worker_ids: None,
             routing_constraints: RoutingConstraints::default(),
-            shared_cache_hits: None,
+            shared_cache_hits: self.shared_cache_hits.clone(),
             resp_tx: None,
         }
     }
@@ -328,10 +327,12 @@ pub(crate) struct OfflineReplayRouter {
     prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
     decay_time_epoch: Instant,
     tracking_hash: TrackingHashContext,
+    hicache: Option<SglangHiCacheState>,
 }
 
 pub(in crate::replay) struct KvRouterPlacement {
     router: OfflineReplayRouter,
+    pending_host_io_debts: Vec<WorkerHostIoDebt>,
 }
 
 impl KvRouterPlacement {
@@ -348,6 +349,7 @@ impl KvRouterPlacement {
                 prefill_load_estimator,
                 num_workers,
             )?,
+            pending_host_io_debts: Vec::new(),
         })
     }
 
@@ -361,6 +363,7 @@ impl KvRouterPlacement {
                 overlap_blocks: admission.overlap_blocks,
                 isl_blocks: admission.isl_blocks,
             }),
+            hicache_target_pages: admission.hicache_target_pages,
         }
     }
 
@@ -460,7 +463,16 @@ impl<Request: PlacementRequestView> PlacementPolicy<Request> for KvRouterPlaceme
 
     fn observe(&mut self, observation: RouterEventBatch, _now_ms: f64) -> Result<Vec<Placement>> {
         let effects = self.router.on_kv_events(observation.0)?;
+        self.pending_host_io_debts.extend(effects.host_io_debts);
         Ok(self.placements(effects.admissions))
+    }
+
+    fn drain_host_io_debts(&mut self) -> Vec<WorkerHostIoDebt> {
+        std::mem::take(&mut self.pending_host_io_debts)
+    }
+
+    fn sglang_hicache_report(&self) -> Option<SglangHiCacheReport> {
+        self.router.hicache.as_ref().map(SglangHiCacheState::report)
     }
 
     fn cancel_pending(&mut self, request_id: Uuid) -> bool {
@@ -529,13 +541,18 @@ impl OfflineReplayRouter {
             slots,
             selector,
             pending: PolicyQueue::new(profile),
-            indexer: SyncReplayIndexer::new(args.block_size as u32),
+            indexer: SyncReplayIndexer::new(),
             prefill_load_estimator,
             // This is only a base Instant for converting replay `now_ms` values into
             // synthetic `Instant`s. All subsequent decay/accounting uses virtual replay
             // time derived from this epoch, not wall-clock progression.
             decay_time_epoch: Instant::now(),
             tracking_hash,
+            hicache: args
+                .sglang
+                .as_ref()
+                .and_then(|sglang| sglang.hicache.clone())
+                .map(|config| SglangHiCacheState::new(config, args.block_size)),
         })
     }
 
@@ -629,15 +646,48 @@ impl OfflineReplayRouter {
                 worker_idx: outcome.worker_idx,
                 overlap_blocks: outcome.overlap_blocks,
                 isl_blocks: outcome.isl_blocks,
+                hicache_target_pages: outcome.hicache_target_pages,
             }],
+            ..Default::default()
         })
     }
 
     pub(crate) fn on_kv_events(&mut self, events: Vec<RouterEvent>) -> Result<RouterEffects> {
+        let mut host_io_debts = Vec::new();
         for event in events {
+            let metadata_event = is_sglang_hicache_metadata_event(&event.event);
+            if let Some(hicache) = self.hicache.as_mut() {
+                let tokens = hicache.apply_router_event(&event);
+                if tokens > 0 {
+                    host_io_debts.push(WorkerHostIoDebt {
+                        scheduler_id: self.scheduler_id_for(WorkerWithDpRank::new(
+                            event.worker_id,
+                            event.event.dp_rank,
+                        ))?,
+                        tokens,
+                    });
+                }
+            }
+            if metadata_event {
+                continue;
+            }
             self.indexer.apply_event(event)?;
         }
-        Ok(RouterEffects::default())
+        Ok(RouterEffects {
+            admissions: Vec::new(),
+            host_io_debts,
+        })
+    }
+
+    fn scheduler_id_for(&self, worker: WorkerWithDpRank) -> Result<usize> {
+        let worker_id = usize::try_from(worker.worker_id)
+            .map_err(|_| anyhow!("worker id does not fit into usize"))?;
+        let dp_rank = usize::try_from(worker.dp_rank)
+            .map_err(|_| anyhow!("dp rank does not fit into usize"))?;
+        worker_id
+            .checked_mul(self.dp_size as usize)
+            .and_then(|base| base.checked_add(dp_rank))
+            .ok_or_else(|| anyhow!("worker/rank scheduler index overflow"))
     }
 
     pub(crate) fn on_prefill_completed(
@@ -651,6 +701,7 @@ impl OfflineReplayRouter {
             .map_err(anyhow::Error::from)?;
         Ok(RouterEffects {
             admissions: self.drain_pending(decay_now)?,
+            ..Default::default()
         })
     }
 
@@ -665,6 +716,7 @@ impl OfflineReplayRouter {
             .map_err(anyhow::Error::from)?;
         Ok(RouterEffects {
             admissions: self.drain_pending(decay_now)?,
+            ..Default::default()
         })
     }
 
@@ -723,6 +775,9 @@ impl OfflineReplayRouter {
             .unregister_worker(wid)
             .map_err(anyhow::Error::from)?;
         self.indexer.tree.remove_worker(wid);
+        if let Some(hicache) = self.hicache.as_mut() {
+            hicache.remove_worker(wid);
+        }
         Ok(())
     }
 
@@ -733,6 +788,7 @@ impl OfflineReplayRouter {
         let decay_now = self.decay_now(now_ms);
         Ok(RouterEffects {
             admissions: self.drain_pending(decay_now)?,
+            ..Default::default()
         })
     }
 
@@ -807,11 +863,11 @@ impl OfflineReplayRouter {
             .uuid
             .ok_or_else(|| anyhow!("offline replay requires requests to have stable UUIDs"))?;
         let (priority_jump, strict_priority) = request.router_priorities();
-        let (overlaps, token_seq) = match replay_hashes {
+        let (overlaps, token_seq, local_block_hashes) = match replay_hashes {
             Some(replay_hashes) => {
                 let overlaps = self
                     .indexer
-                    .find_matches_for_hashes(replay_hashes.local_block_hashes);
+                    .find_matches_for_hashes(&replay_hashes.local_block_hashes);
                 let token_seq = if !self.config.router_track_active_blocks {
                     None
                 } else if self.config.router_assume_kv_reuse
@@ -832,11 +888,16 @@ impl OfflineReplayRouter {
                         None,
                     )
                 };
-                (overlaps, token_seq)
+                (overlaps, token_seq, replay_hashes.local_block_hashes)
             }
             None => {
                 let tokens = request_view.prompt_tokens();
-                let overlaps = self.indexer.find_matches_for_request(&tokens, None);
+                let local_block_hashes = compute_block_hash_for_seq(
+                    &tokens,
+                    self.block_size,
+                    BlockHashOptions::default(),
+                );
+                let overlaps = self.indexer.find_matches_for_hashes(&local_block_hashes);
                 let token_seq = self.config.compute_seq_hashes_for_tracking_with_context(
                     &self.tracking_hash,
                     self.tracking_hash_scope(),
@@ -845,15 +906,27 @@ impl OfflineReplayRouter {
                     BlockHashOptions::default(),
                     None,
                 );
-                (overlaps, token_seq)
+                (overlaps, token_seq, local_block_hashes)
             }
         };
 
-        Ok(PendingRequest {
+        let mut sequence_block_hashes = SglangHiCacheState::sequence_hashes(&local_block_hashes);
+        if self.hicache.is_some() {
+            // SGLang must compute at least one prompt token. Keep router/L2/L3
+            // credit on the same input_length-1 boundary as admission and the
+            // ideal-L1 reference.
+            sequence_block_hashes
+                .truncate(input_length.saturating_sub(1) / self.block_size as usize);
+        }
+        let mut pending = PendingRequest {
             uuid,
             token_seq,
             isl_tokens: input_length,
             overlaps,
+            sequence_block_hashes,
+            tier_overlap_blocks: TierOverlapBlocks::default(),
+            shared_cache_hits: None,
+            host_cache_hit_weight: self.config.host_cache_hit_weight,
             track_prefill_tokens: self.config.router_track_prefill_tokens,
             expected_output_tokens: Some(
                 u32::try_from(max_output_tokens)
@@ -863,7 +936,51 @@ impl OfflineReplayRouter {
             strict_priority,
             policy_class: request.policy_class.clone(),
             session_id,
-        })
+        };
+        self.refresh_hicache_signals(&mut pending);
+        Ok(pending)
+    }
+
+    fn refresh_hicache_signals(&self, request: &mut PendingRequest) {
+        if let Some(hicache) = self.hicache.as_ref() {
+            for (worker, blocks) in &mut request.overlaps.scores {
+                let dsv4_blocks =
+                    hicache.device_prefix_blocks(*worker, &request.sequence_block_hashes);
+                *blocks = (*blocks).min(u32::try_from(dsv4_blocks).unwrap_or(u32::MAX));
+            }
+        }
+        let mut tier_overlap_blocks = TierOverlapBlocks::default();
+        tier_overlap_blocks.device.extend(
+            request
+                .overlaps
+                .scores
+                .iter()
+                .map(|(worker, blocks)| (*worker, *blocks as usize)),
+        );
+
+        let shared_cache_hits = self.hicache.as_ref().map(|hicache| {
+            for (&worker_id, config) in &self.workers_with_configs {
+                let start = config.data_parallel_start_rank();
+                let end = start.saturating_add(config.data_parallel_size());
+                for dp_rank in start..end {
+                    let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+                    let device_blocks =
+                        request.overlaps.scores.get(&worker).copied().unwrap_or(0) as usize;
+                    let extension = hicache.l2_extension_blocks(
+                        worker,
+                        &request.sequence_block_hashes,
+                        device_blocks,
+                    );
+                    if extension > 0 {
+                        tier_overlap_blocks.host_pinned.insert(worker, extension);
+                    }
+                }
+            }
+            hicache.shared_hits(&request.sequence_block_hashes)
+        });
+
+        request.tier_overlap_blocks = tier_overlap_blocks;
+        request.shared_cache_hits = shared_cache_hits;
     }
 
     fn tracking_hash_scope(&self) -> TrackingHashScope<'_> {
@@ -875,9 +992,10 @@ impl OfflineReplayRouter {
 
     fn admit_request(
         &mut self,
-        request: PendingRequest,
+        mut request: PendingRequest,
         decay_now: Instant,
     ) -> Result<AdmitOutcome> {
+        self.refresh_hicache_signals(&mut request);
         let worker_loads = self
             .slots
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
@@ -907,6 +1025,19 @@ impl OfflineReplayRouter {
         let isl_blocks = u32::try_from(request.isl_tokens.div_ceil(self.block_size as usize))
             .unwrap_or(u32::MAX);
         let overlap_blocks = selection.effective_overlap_blocks.floor() as u32;
+        let device_blocks = request
+            .overlaps
+            .scores
+            .get(&selection.worker)
+            .copied()
+            .unwrap_or(0) as usize;
+        let hicache_target_pages = self.hicache.as_mut().map_or(0, |hicache| {
+            hicache.prefetch_selected_prefix(
+                selection.worker,
+                &request.sequence_block_hashes,
+                device_blocks,
+            )
+        });
 
         self.slots
             .add_request(
@@ -927,6 +1058,7 @@ impl OfflineReplayRouter {
             worker_idx,
             overlap_blocks,
             isl_blocks,
+            hicache_target_pages,
         })
     }
 
@@ -948,6 +1080,7 @@ impl OfflineReplayRouter {
                 worker_idx: outcome.worker_idx,
                 overlap_blocks: outcome.overlap_blocks,
                 isl_blocks: outcome.isl_blocks,
+                hicache_target_pages: outcome.hicache_target_pages,
             });
         }
 
@@ -1047,7 +1180,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{OfflineReplayRouter, ReplayRequestHashes, SyncReplayIndexer, WorkerAdmission};
-    use crate::common::protocols::{DirectRequest, MockEngineArgs};
+    use crate::common::protocols::{
+        DirectRequest, EngineType, MockEngineArgs, SglangArgs, SglangHiCacheArgs,
+        SglangHiCacheStorageLayout, SglangHiCacheWritePolicy,
+    };
+    use crate::kv_manager::sglang_backend::SGLANG_HICACHE_METADATA_EVENT_ID_BIT;
     use crate::replay::ReplayPrefillLoadEstimator;
 
     struct FixedPrefillLoadEstimator {
@@ -1077,6 +1214,27 @@ mod tests {
         MockEngineArgs::builder()
             .block_size(64)
             .max_num_batched_tokens(Some(64))
+            .build()
+            .unwrap()
+    }
+
+    fn hicache_replay_args() -> MockEngineArgs {
+        MockEngineArgs::builder()
+            .engine_type(EngineType::Sglang)
+            .block_size(256)
+            .sglang(Some(SglangArgs {
+                page_size: Some(256),
+                hicache: Some(SglangHiCacheArgs {
+                    write_policy: SglangHiCacheWritePolicy::WriteBack,
+                    l1_swa_capacity_tokens: 256,
+                    l2_full_capacity_tokens: 512,
+                    l2_swa_capacity_tokens: 256,
+                    l3_capacity_gib: 1,
+                    io_tokens_per_second: 160_000,
+                    storage_layout: SglangHiCacheStorageLayout::Dsv4FlashTp4AttnCp4Fp32,
+                }),
+                ..Default::default()
+            }))
             .build()
             .unwrap()
     }
@@ -1188,6 +1346,27 @@ mod tests {
     }
 
     #[test]
+    fn hicache_metadata_sideband_does_not_enter_primary_index() {
+        let mut router = OfflineReplayRouter::new(&hicache_replay_args(), None, None, 1).unwrap();
+        router
+            .on_kv_events(vec![store_event(
+                0,
+                SGLANG_HICACHE_METADATA_EVENT_ID_BIT | 1,
+                77,
+                StorageTier::Device,
+            )])
+            .unwrap();
+
+        assert!(
+            router
+                .indexer
+                .find_matches_for_hashes(&[LocalBlockHash(77)])
+                .scores
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn keyed_replay_hashes_derive_tracking_identities_from_tokens() {
         let mut key_file = NamedTempFile::new().unwrap();
         key_file.write_all(&[0x39; 32]).unwrap();
@@ -1224,7 +1403,7 @@ mod tests {
 
     #[test]
     fn lower_tier_events_do_not_enter_offline_primary_index() {
-        let mut indexer = SyncReplayIndexer::new(64);
+        let mut indexer = SyncReplayIndexer::new();
 
         indexer
             .apply_event(store_event(7, 1, 101, StorageTier::HostPinned))
@@ -1345,6 +1524,7 @@ mod tests {
                 worker_idx: 1,
                 overlap_blocks: 1,
                 isl_blocks: 1,
+                hicache_target_pages: 0,
             }]
         );
     }
@@ -1730,6 +1910,7 @@ policy_classes:
                 worker_idx: 3,
                 overlap_blocks: 0,
                 isl_blocks: 1,
+                hicache_target_pages: 0,
             }]
         );
     }
@@ -1827,6 +2008,7 @@ policy_classes:
                 worker_idx: 1,
                 overlap_blocks: 0,
                 isl_blocks: 1,
+                hicache_target_pages: 0,
             }]
         );
         assert_eq!(router.pending_count(), 0);

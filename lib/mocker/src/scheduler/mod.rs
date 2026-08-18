@@ -12,6 +12,7 @@ pub mod vllm;
 
 pub use crate::common::protocols::ForwardPassSnapshot;
 use crate::common::protocols::{DirectRequest, OutputSignal};
+use crate::kv_manager::sglang_backend::HicacheHydration;
 use dynamo_kv_router::protocols::RouterEvent;
 pub(crate) use kv_event_sink::{CapturedRouterEventBuffer, capture_router_event_sink};
 pub(crate) use live_boundary::{
@@ -241,6 +242,23 @@ pub(crate) enum EngineCore {
 }
 
 impl EngineCore {
+    pub(crate) fn record_sglang_hicache_io_tokens(&mut self, tokens: usize) {
+        if let Self::Sglang(core) = self {
+            core.record_hicache_io_tokens(tokens);
+        }
+    }
+
+    pub(crate) fn hydrate_sglang_prefix(
+        &mut self,
+        token_ids: &[u32],
+        target_pages: usize,
+    ) -> HicacheHydration {
+        match self {
+            Self::Sglang(core) => core.hydrate_prefix_from_hicache(token_ids, target_pages),
+            Self::Vllm(_) => HicacheHydration::default(),
+        }
+    }
+
     pub(crate) fn receive(&mut self, request: DirectRequest) -> Uuid {
         match self {
             Self::Vllm(core) => core.receive(request),

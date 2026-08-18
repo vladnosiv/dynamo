@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
 use dynamo_mocker::common::protocols::{
-    EngineType, KvTransferTimingMode, MockEngineArgs, SglangArgs, WorkerType,
+    EngineType, KvTransferTimingMode, MockEngineArgs, SglangArgs, SglangHiCacheArgs, WorkerType,
 };
 use dynamo_mocker::loadgen::Trace;
 use dynamo_mocker::replay::{
@@ -25,7 +25,7 @@ use dynamo_mocker::replay::{
     CanonicalSemanticFeatures, CanonicalSlaMetadata, CanonicalWorkloadMetadata,
     OfflineDisaggReplayConfig, OfflineRuntimeEvidence, ReplayArgsMode, ReplayCaptureOptions,
     ReplayDeterminism, ReplayRouterMode, SlaThresholds, TraceSimulationReport,
-    canonical_router_metadata, canonical_topology,
+    canonical_router_metadata_for_args, canonical_topology,
     simulate_loaded_trace_disagg_with_router_mode_and_options,
     simulate_loaded_trace_with_router_mode_and_options, with_replay_determinism,
     with_runtime_evidence,
@@ -168,6 +168,10 @@ struct Args {
     #[arg(long, default_value_t = 64)]
     block_size: usize,
 
+    /// JSON file containing `SglangHiCacheArgs` for direct HiCache replay.
+    #[arg(long)]
+    sglang_hicache_config: Option<PathBuf>,
+
     /// Override GPU KV-cache block capacity per worker
     #[arg(long)]
     num_gpu_blocks: Option<usize>,
@@ -274,10 +278,26 @@ fn build_engine_args(args: &Args) -> Result<MockEngineArgs> {
         .kv_transfer_bandwidth(args.kv_transfer_bandwidth)
         .kv_transfer_timing_mode(args.kv_transfer_timing_mode.into());
     if args.engine_type == EngineTypeArg::Sglang {
+        let hicache = args
+            .sglang_hicache_config
+            .as_ref()
+            .map(|path| {
+                let file = File::open(path)
+                    .with_context(|| format!("failed to open SGLang HiCache config at {path:?}"))?;
+                serde_json::from_reader::<_, SglangHiCacheArgs>(file)
+                    .with_context(|| format!("failed to parse SGLang HiCache config at {path:?}"))
+            })
+            .transpose()?;
         builder = builder.sglang(Some(SglangArgs {
             page_size: Some(args.block_size),
+            hicache,
             ..Default::default()
         }));
+    } else {
+        ensure!(
+            args.sglang_hicache_config.is_none(),
+            "--sglang-hicache-config requires --engine-type sglang"
+        );
     }
     if let Some(max_num_seqs) = args.max_num_seqs {
         builder = builder.max_num_seqs(Some(max_num_seqs));
@@ -367,7 +387,7 @@ fn canonical_report(
             aic_prefill_load_estimator_implementation: None,
         },
         engine_config,
-        router: canonical_router_metadata(router_mode, None)?,
+        router: canonical_router_metadata_for_args(router_mode, None, engine_args)?,
         sla: CanonicalSlaMetadata {
             ttft_ms: None,
             itl_ms: None,

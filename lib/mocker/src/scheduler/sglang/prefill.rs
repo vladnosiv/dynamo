@@ -63,7 +63,14 @@ pub(super) fn get_new_batch_prefill(
     while can_run.len() < available_running_slots
         && let Some(mut req) = waiting.pop_front()
     {
-        let extend_input = req.extend_input_len();
+        let initial_reusable_tokens = if req.materialized_tokens == 0 {
+            kv_manager.hicache_reusable_prefix_tokens(req.sequence_tokens())
+        } else {
+            0
+        };
+        let extend_input = req
+            .extend_input_len()
+            .saturating_sub(initial_reusable_tokens);
         if extend_input == 0 {
             rejected.push_back(req);
             break;
@@ -87,7 +94,9 @@ pub(super) fn get_new_batch_prefill(
             req.remaining_output_tokens()
                 .min(config.clip_max_new_tokens)
         };
-        if charged_input_tokens + output_reserve as f64 >= rem_total_tokens {
+        if charged_input_tokens + output_reserve as f64 + initial_reusable_tokens as f64
+            >= rem_total_tokens
+        {
             rejected.push_back(req);
             break;
         }
@@ -96,13 +105,27 @@ pub(super) fn get_new_batch_prefill(
             break;
         }
 
-        let chunk_end = req.materialized_tokens + chunk_tokens;
         let old_allocated_tokens = req.allocated_tokens;
         let mut lease = std::mem::take(&mut req.kv_lease);
+        if initial_reusable_tokens > 0 {
+            let primed = kv_manager.prime_hicache_reusable_prefix(
+                req.sequence_tokens(),
+                initial_reusable_tokens,
+                &mut lease,
+            );
+            assert!(
+                primed,
+                "single-threaded HiCache prefix changed between probe and admission"
+            );
+            req.materialized_tokens = initial_reusable_tokens;
+            req.allocated_tokens = initial_reusable_tokens;
+        }
+        let allocation_base_tokens = req.allocated_tokens;
+        let chunk_end = req.materialized_tokens + chunk_tokens;
         let alloc_tokens = req.sequence_prefix(chunk_end);
         if req.materialized_tokens > 0 {
             let target_allocated_tokens = ceil_to_block(chunk_end, config.block_size);
-            let required_capacity = target_allocated_tokens.saturating_sub(old_allocated_tokens);
+            let required_capacity = target_allocated_tokens.saturating_sub(allocation_base_tokens);
             let available = kv_manager.cache().available_tokens();
             if available < required_capacity {
                 kv_manager.evict(required_capacity - available);

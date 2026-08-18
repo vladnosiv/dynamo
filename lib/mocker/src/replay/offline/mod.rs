@@ -13,6 +13,7 @@ pub(crate) mod events;
 pub(crate) mod evidence;
 mod executor;
 pub(crate) mod extensions;
+mod ideal_l1;
 mod progress;
 pub(crate) mod runtime_utils;
 pub(crate) mod scaling;

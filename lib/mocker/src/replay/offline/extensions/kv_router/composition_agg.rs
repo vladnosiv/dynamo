@@ -24,7 +24,9 @@ use crate::replay::offline::components::{
 use crate::replay::offline::core::round_robin::AggregatedRoundRobinPlacement;
 use crate::replay::offline::core::{EngineEventBatch, WorkerTopology};
 #[cfg(test)]
-use crate::replay::offline::core::{Placement, PlacementEffects, PlacementPolicy};
+use crate::replay::offline::core::{
+    Placement, PlacementEffects, PlacementPolicy, WorkerHostIoDebt,
+};
 use crate::replay::offline::extensions::kv_events::{RouterEventBatch, RouterEventObservation};
 use crate::replay::{ReplayPrefillLoadEstimator, ReplayRouterMode};
 
@@ -116,6 +118,28 @@ impl PlacementPolicy<ReplayRequestPayload> for AdaptiveAggPlacement {
             }
             Self::Kv(policy) => {
                 PlacementPolicy::<ReplayRequestPayload>::observe(policy, observation, now_ms)
+            }
+        }
+    }
+
+    fn drain_host_io_debts(&mut self) -> Vec<WorkerHostIoDebt> {
+        match self {
+            Self::RoundRobin(policy) => {
+                PlacementPolicy::<ReplayRequestPayload>::drain_host_io_debts(policy)
+            }
+            Self::Kv(policy) => {
+                PlacementPolicy::<ReplayRequestPayload>::drain_host_io_debts(policy)
+            }
+        }
+    }
+
+    fn sglang_hicache_report(&self) -> Option<crate::kv_manager::SglangHiCacheReport> {
+        match self {
+            Self::RoundRobin(policy) => {
+                PlacementPolicy::<ReplayRequestPayload>::sglang_hicache_report(policy)
+            }
+            Self::Kv(policy) => {
+                PlacementPolicy::<ReplayRequestPayload>::sglang_hicache_report(policy)
             }
         }
     }
